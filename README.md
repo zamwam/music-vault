@@ -1,8 +1,8 @@
-# MusicVault V4
+# MusicVault
 
 Spotify-style local music player for Windows.
 
-## V4 improvements
+## Improvements
 - Much smoother UI on large libraries
 - Debounced search instead of refreshing on every keystroke
 - Incremental table rendering so thousands of songs do not freeze the window
