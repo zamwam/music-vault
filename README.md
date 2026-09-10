@@ -18,6 +18,8 @@ Spotify-style local music player for Windows.
 - Spotify-style track details popup from any song row or the current player
 - Track metadata, artwork, format, queue, favorite, and file-location actions
 - Optional hidden-file scanning and favorite-removal confirmation
+- Expanded Settings with startup view, player height, Home artwork size, library result limits,
+  and independent Home-section visibility toggles
 - Embedded Now Playing page is the default; Separate Window remains optional
 - Home dashboard with Continue Listening, Recently Played, Recently Added, Most Played,
   Favorites, Likes, and Never Played rails

@@ -64,7 +64,13 @@ def load_settings():
         "reduced_motion": False,
         "density": "Comfortable",
         "library_page_size": 250,
-        "start_minimized": False,
+        "startup_view": "Home",
+        "player_height": "Standard",
+        "home_artwork_size": "Medium",
+        "home_sections": {
+            "continue": True, "played": True, "added": True, "most": True,
+            "favorites": True, "liked": True, "never": True,
+        },
         "shuffle_mode": "Random",
         "crossfade": 0,
         "sleep_timer": 0,
@@ -521,7 +527,7 @@ class MusicVault(tk.Tk):
         self.configure(bg=self.bg)
         self.protocol("WM_DELETE_WINDOW", self.close)
 
-        self.view = "Home"
+        self.view = self.settings.get("startup_view", "Home")
         self.playlist_name = None
         self.visible = []
         self.library_view_state = {}
@@ -575,7 +581,11 @@ class MusicVault(tk.Tk):
         self.build()
         self.bind("<Configure>", self.window_resized, add="+")
         self.refresh_playlists()
-        self.show_home_view()
+        self.view_title.config(text=self.view)
+        if self.view == "Home":
+            self.show_home_view()
+        else:
+            self.show_library_view()
 
         if self.settings.get("auto_scan", True):
             self.after(600, self.start_scan)
@@ -842,19 +852,20 @@ class MusicVault(tk.Tk):
     def refresh_home_dashboard(self):
         for child in self.home_inner.winfo_children():
             child.destroy()
+        enabled = self.settings.get("home_sections", {})
         sections = [
-            ("Continue Listening", self.db.history_songs(20, incomplete=True)),
-            ("Recently Played", self.db.history_songs(20)),
-            ("Recently Added", self.db.recently_added(20)),
-            ("Most Played", self.db.most_played(20)),
-            ("Favorite Songs", [s for s in self.get_library() if s["id"] in self.db.favorites()][:20]),
-            ("Liked Songs", self.db.liked_songs(20)),
-            ("Never Played", self.db.never_played(20)),
+            ("continue", "Continue Listening", self.db.history_songs(20, incomplete=True)),
+            ("played", "Recently Played", self.db.history_songs(20)),
+            ("added", "Recently Added", self.db.recently_added(20)),
+            ("most", "Most Played", self.db.most_played(20)),
+            ("favorites", "Favorite Songs", [s for s in self.get_library() if s["id"] in self.db.favorites()][:20]),
+            ("liked", "Liked Songs", self.db.liked_songs(20)),
+            ("never", "Never Played", self.db.never_played(20)),
         ]
         has_content = False
         reveal_delay = 0
-        for title, songs in sections:
-            if songs:
+        for key, title, songs in sections:
+            if enabled.get(key, True) and songs:
                 block = self.home_section(title, songs)
                 if self.settings.get("smooth_ui", True) and not self.settings.get("reduced_motion", False):
                     block.pack_forget()
@@ -871,7 +882,10 @@ class MusicVault(tk.Tk):
         compact = self.settings.get("density", "Comfortable") == "Compact"
         card_width = 126 if compact else 142
         card_height = 140 if compact else 155
-        art_size = 92 if compact else 106
+        artwork_sizes = {"Small": 82, "Medium": 106, "Large": 124}
+        art_size = artwork_sizes.get(self.settings.get("home_artwork_size", "Medium"), 106)
+        if compact:
+            art_size = min(art_size, 92)
         rail_height = 155 if compact else 170
         tk.Label(block, text=title, bg=self.bg, fg=self.text,
                  font=("Segoe UI Semibold", 14)).pack(anchor="w", pady=(0, 8))
@@ -916,7 +930,9 @@ class MusicVault(tk.Tk):
         self.show_now_playing()
 
     def build_player(self):
-        p = tk.Frame(self, bg=self.panel, height=128)
+        heights = {"Compact": 104, "Standard": 128, "Tall": 154}
+        p = tk.Frame(self, bg=self.panel, height=heights.get(
+            self.settings.get("player_height", "Standard"), 128))
         self.player_frame = p
         p.pack(side="bottom", fill="x")
         p.pack_propagate(False)
@@ -1478,12 +1494,13 @@ class MusicVault(tk.Tk):
             self.refresh()
 
     def base_songs(self):
+        page_size = max(50, int(self.settings.get("library_page_size", 250)))
         if self.playlist_name:
             return self.db.playlist(self.playlist_name)
         if self.view == "Recently Added":
-            return self.db.recently_added(200)
+            return self.db.recently_added(page_size)
         if self.view == "Most Played":
-            return self.db.most_played(200)
+            return self.db.most_played(page_size)
         if self.view == "5 Star Songs":
             rated = self.db.ratings()
             return [song for song in self.get_library() if rated.get(song["id"]) == 5]
@@ -2442,8 +2459,22 @@ class MusicVault(tk.Tk):
         self.button(tools,"Add Drive",lambda:self.add_setting_folder(lb),
                     bg=self.panel2,padx=14,pady=8).pack(fill="x")
 
-        opts=tk.Frame(win,bg=self.bg)
-        opts.pack(fill="x",padx=25,pady=12)
+        opts_host = tk.Frame(win, bg=self.bg, height=230)
+        opts_host.pack(fill="x", padx=25, pady=12)
+        opts_host.pack_propagate(False)
+        opts_canvas = tk.Canvas(opts_host, bg=self.bg, highlightthickness=0)
+        opts_scroll = ttk.Scrollbar(opts_host, orient="vertical", command=opts_canvas.yview)
+        opts = tk.Frame(opts_canvas, bg=self.bg)
+        opts_window = opts_canvas.create_window((0, 0), window=opts, anchor="nw")
+        opts_canvas.configure(yscrollcommand=opts_scroll.set)
+        opts.bind("<Configure>", lambda event: opts_canvas.configure(
+            scrollregion=opts_canvas.bbox("all")))
+        opts_canvas.bind("<Configure>", lambda event: opts_canvas.itemconfigure(
+            opts_window, width=event.width))
+        opts_canvas.bind("<MouseWheel>", lambda event: opts_canvas.yview_scroll(
+            -int(event.delta / 120) or (-1 if event.delta > 0 else 1), "units"))
+        opts_canvas.pack(side="left", fill="both", expand=True)
+        opts_scroll.pack(side="right", fill="y")
         auto=tk.BooleanVar(value=self.settings.get("auto_scan",True))
         resume=tk.BooleanVar(value=self.settings.get("resume",True))
         confirm=tk.BooleanVar(value=self.settings.get("confirm_delete_playlist",True))
@@ -2456,6 +2487,15 @@ class MusicVault(tk.Tk):
         smooth_ui=tk.BooleanVar(value=self.settings.get("smooth_ui",True))
         reduced_motion=tk.BooleanVar(value=self.settings.get("reduced_motion",False))
         density=tk.StringVar(value=self.settings.get("density", "Comfortable"))
+        startup_view=tk.StringVar(value=self.settings.get("startup_view", "Home"))
+        player_height=tk.StringVar(value=self.settings.get("player_height", "Standard"))
+        home_artwork_size=tk.StringVar(value=self.settings.get("home_artwork_size", "Medium"))
+        library_page_size=tk.StringVar(value=str(self.settings.get("library_page_size", 250)))
+        saved_home_sections = self.settings.get("home_sections", {})
+        if not isinstance(saved_home_sections, dict):
+            saved_home_sections = {}
+        home_section_vars = {key: tk.BooleanVar(value=saved_home_sections.get(key, True))
+                             for key in ("continue", "played", "added", "most", "favorites", "liked", "never")}
         shuffle_mode=tk.StringVar(value=self.settings.get("shuffle_mode", "Random"))
         for text,var in [("Scan automatically at startup",auto),
                          ("Resume songs where you left off",resume),
@@ -2488,6 +2528,29 @@ class MusicVault(tk.Tk):
         ttk.Combobox(shuffle_row, textvariable=shuffle_mode,
                  values=["Random", "Smart", "Artist Variety", "Album Variety"],
                  state="readonly", width=18).pack(side="left", padx=12)
+        display_row=tk.Frame(opts,bg=self.bg)
+        display_row.pack(fill="x", pady=(8, 0))
+        for label, variable, values in (
+            ("Startup view", startup_view, ["Home", "Songs", "Albums", "Artists", "Favorites", "Recently Added", "Most Played"]),
+            ("Player height", player_height, ["Compact", "Standard", "Tall"]),
+            ("Home artwork", home_artwork_size, ["Small", "Medium", "Large"]),
+            ("Library result limit", library_page_size, ["100", "250", "500", "1000"]),
+        ):
+            row=tk.Frame(opts,bg=self.bg)
+            row.pack(fill="x", pady=(5, 0))
+            tk.Label(row,text=label,bg=self.bg,fg=self.text,
+                     font=("Segoe UI Semibold",9),width=20,anchor="w").pack(side="left")
+            ttk.Combobox(row,textvariable=variable,values=values,
+                         state="readonly",width=20).pack(side="left",padx=12)
+        tk.Label(opts,text="HOME SECTIONS",bg=self.bg,fg=self.muted,
+                 font=("Segoe UI Semibold",9)).pack(anchor="w",pady=(12,4))
+        for label, key in (("Continue Listening", "continue"), ("Recently Played", "played"),
+                           ("Recently Added", "added"), ("Most Played", "most"),
+                           ("Favorite Songs", "favorites"), ("Liked Songs", "liked"),
+                           ("Never Played", "never")):
+            tk.Checkbutton(opts,text=label,variable=home_section_vars[key],bg=self.bg,fg=self.text,
+                           selectcolor=self.panel2,activebackground=self.bg,
+                           activeforeground=self.text).pack(anchor="w")
 
         foot=tk.Frame(win,bg=self.bg);foot.pack(fill="x",padx=25,pady=(0,20))
         def save(and_scan=False):
@@ -2500,6 +2563,11 @@ class MusicVault(tk.Tk):
             self.settings["smooth_ui"]=smooth_ui.get()
             self.settings["reduced_motion"]=reduced_motion.get()
             self.settings["density"]=density.get()
+            self.settings["startup_view"]=startup_view.get()
+            self.settings["player_height"]=player_height.get()
+            self.settings["home_artwork_size"]=home_artwork_size.get()
+            self.settings["library_page_size"]=int(library_page_size.get())
+            self.settings["home_sections"]={key: variable.get() for key, variable in home_section_vars.items()}
             self.settings["remember_shuffle"]=remember_shuffle.get()
             self.settings["remember_repeat"]=remember_repeat.get()
             self.settings["scan_hidden"]=scan_hidden.get()
@@ -2507,6 +2575,8 @@ class MusicVault(tk.Tk):
             self.settings["shuffle_mode"]=shuffle_mode.get()
             self.shuffle_mode=shuffle_mode.get()
             self.style_widgets()
+            self.player_frame.config(height={"Compact": 104, "Standard": 128, "Tall": 154}.get(
+                player_height.get(), 128))
             save_settings(self.settings);win.destroy()
             if statusbar.get():
                 self.status_label.place(x=240, y=53)
@@ -2516,7 +2586,12 @@ class MusicVault(tk.Tk):
             if albumstrip.get() and self.album_strip.winfo_manager()=="":
                 self.album_strip.pack(fill="x", pady=(12,8), before=self.tree.master)
             if and_scan:self.start_scan()
-            else:self.status.set("Settings saved")
+            else:
+                if self.view == "Home":
+                    self.refresh_home_dashboard()
+                else:
+                    self.refresh()
+                self.status.set("Settings saved")
         self.button(foot,"Save",save,bg=self.panel2,padx=20,pady=9).pack(side="right",padx=7)
         self.button(foot,"Save & Scan",lambda:save(True),
                     bg=self.blue,fg="white",padx=20,pady=9).pack(side="right")
