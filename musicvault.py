@@ -564,6 +564,7 @@ class _LegacyDB:
 
 from database import DB
 from duplicate_finder import find_duplicate_groups
+from lyrics import load_lyrics, parse_lyrics
 from organizer import apply_plan, build_plan
 
 
@@ -953,6 +954,7 @@ class MusicVault(tk.Tk):
     def button(self, parent, text, command, **kw):
         background = kw.pop("bg", self.panel)
         hover_background = kw.pop("hover", self.blue2 if background == self.blue else self.hover)
+        tooltip = kw.pop("tooltip", text)
         button = tk.Button(
             parent, text=text, command=command, bg=background,
             fg=kw.pop("fg", self.text), activebackground=kw.pop("activebackground", self.hover),
@@ -990,7 +992,49 @@ class MusicVault(tk.Tk):
 
         button.bind("<Enter>", lambda event: animate(hover_background), add="+")
         button.bind("<Leave>", lambda event: animate(background), add="+")
+        self.add_tooltip(button, tooltip)
         return button
+
+    def add_tooltip(self, widget, text):
+        if not text:
+            return
+        tooltip_job = None
+        tooltip_window = None
+
+        def hide(event=None):
+            nonlocal tooltip_job, tooltip_window
+            if tooltip_job:
+                try:
+                    self.after_cancel(tooltip_job)
+                except tk.TclError:
+                    pass
+                tooltip_job = None
+            if tooltip_window and tooltip_window.winfo_exists():
+                tooltip_window.destroy()
+            tooltip_window = None
+
+        def show(event=None):
+            nonlocal tooltip_window
+            if tooltip_window or not widget.winfo_exists():
+                return
+            tooltip_window = tk.Toplevel(widget)
+            tooltip_window.wm_overrideredirect(True)
+            tooltip_window.attributes("-topmost", True)
+            label = tk.Label(tooltip_window, text=text, bg="#111827", fg="#f9fafb",
+                             padx=8, pady=4, font=("Segoe UI", 8))
+            label.pack()
+            x = widget.winfo_rootx() + max(0, (widget.winfo_width() - label.winfo_reqwidth()) // 2)
+            y = widget.winfo_rooty() + widget.winfo_height() + 6
+            tooltip_window.geometry(f"+{x}+{y}")
+
+        def schedule(event=None):
+            nonlocal tooltip_job
+            hide()
+            tooltip_job = self.after(550, show)
+
+        widget.bind("<Enter>", schedule, add="+")
+        widget.bind("<Leave>", hide, add="+")
+        widget.bind("<ButtonPress>", hide, add="+")
 
     def build(self):
         header = tk.Frame(self, bg=self.panel, height=68,
@@ -1443,6 +1487,7 @@ class MusicVault(tk.Tk):
                     font=("Segoe UI", 20))
         self.art.pack(fill="both", expand=True)
         self.art.bind("<Button-1>", lambda e: self.show_now_playing())
+        self.add_tooltip(self.art, "Open Now Playing")
 
         info = tk.Frame(p, bg=self.panel, width=250)
         self.player_info = info
@@ -1453,10 +1498,12 @@ class MusicVault(tk.Tk):
                                   anchor="w")
         self.now_title.pack(fill="x")
         self.now_title.bind("<Button-1>", lambda e: self.show_now_playing())
+        self.add_tooltip(self.now_title, "Open Now Playing")
         self.now_artist = tk.Label(info, text="", bg=self.panel, fg=self.muted,
                                    font=("Segoe UI",9), anchor="w")
         self.now_artist.pack(fill="x", pady=3)
         self.now_artist.bind("<Button-1>", lambda e: self.show_now_playing())
+        self.add_tooltip(self.now_artist, "Open Now Playing")
 
         center = tk.Frame(p, bg=self.panel)
         self.player_center = center
@@ -1471,6 +1518,7 @@ class MusicVault(tk.Tk):
                                   highlightthickness=0,
                                   cursor="hand2")
         self.play_btn.pack(side="left",padx=9)
+        self.add_tooltip(self.play_btn, "Play or pause")
         self.player_button(controls,"▶▶",self.next)
         self.repeat_btn = self.player_button(controls,"↻",self.toggle_repeat)
         self.like_btn = self.player_button(controls,"♡",self.like_current)
@@ -1490,6 +1538,7 @@ class MusicVault(tk.Tk):
         self.seekbar = ttk.Scale(timeline,from_=0,to=100,orient="horizontal",
                                  variable=self.seek_var, command=self.seek_moving)
         self.seekbar.pack(side="left",fill="x",expand=True,padx=10)
+        self.add_tooltip(self.seekbar, "Seek through the current track")
         self.seekbar.bind("<ButtonPress-1>", self.seek_press)
         self.seekbar.bind("<ButtonRelease-1>", self.seek_release)
 
@@ -1506,11 +1555,25 @@ class MusicVault(tk.Tk):
                                 value=float(self.settings.get("volume",.75)),
                                 command=self.set_volume,length=110)
         self.volume.pack()
+        self.add_tooltip(self.volume, "Volume")
 
     def player_button(self,parent,text,command):
+        tooltips = {
+            "⤨": "Toggle shuffle",
+            "◀◀": "Previous track",
+            "▶▶": "Next track",
+            "↻": "Toggle repeat",
+            "♡": "Like track",
+            "♧": "Dislike track",
+            "☆": "Toggle favorite",
+            "INFO": "Open track details",
+            "FULL": "Open fullscreen player",
+            "☷ Queue": "Open queue",
+        }
         b=self.button(parent,text,command,bg=self.panel,fg=self.muted,
                       activebackground=self.panel,activeforeground=self.blue2,
-                      font=("Segoe UI",12),padx=8,pady=4)
+                      font=("Segoe UI",12),padx=8,pady=4,
+                      tooltip=tooltips.get(text, text))
         b.pack(side="left",padx=6)
         return b
 
@@ -1733,6 +1796,38 @@ class MusicVault(tk.Tk):
         self.button(controls, "👎", self.dislike_current, bg=self.panel2,
                 padx=9, pady=8).pack(side="left", padx=3)
 
+        self.lyrics_panel = tk.Frame(body, bg=self.bg)
+        lyrics_header = tk.Frame(self.lyrics_panel, bg=self.bg)
+        lyrics_header.pack(fill="x", padx=38, pady=(22, 4))
+        tk.Label(lyrics_header, text="LYRICS", bg=self.bg, fg=self.blue2,
+             font=("Segoe UI Semibold", 10)).pack(side="left")
+        self.lyrics_source = tk.Label(lyrics_header, text="", bg=self.bg, fg=self.muted,
+                          font=("Segoe UI", 8))
+        self.lyrics_source.pack(side="left", padx=10)
+        self.button(lyrics_header, "Edit", self.edit_lyrics, bg=self.panel2,
+                padx=8, pady=3).pack(side="right")
+        self.button(lyrics_header, "Save", self.save_lyrics, bg=self.panel2,
+                padx=8, pady=3).pack(side="right", padx=(0, 5))
+        lyrics_wrap = tk.Frame(self.lyrics_panel, bg=self.panel)
+        lyrics_wrap.pack(fill="both", expand=True, padx=38, pady=(0, 14))
+        self.lyrics_text = tk.Text(lyrics_wrap, height=7, wrap="word", state="disabled",
+                       bg=self.panel, fg=self.muted, insertbackground=self.text,
+                       relief="flat", bd=0, padx=18, pady=12,
+                       font=("Segoe UI", 11), spacing3=5)
+        self.lyrics_text.pack(side="left", fill="both", expand=True)
+        lyrics_scroll = ttk.Scrollbar(lyrics_wrap, orient="vertical",
+                          command=self.lyrics_text.yview)
+        lyrics_scroll.pack(side="right", fill="y")
+        self.lyrics_text.configure(yscrollcommand=lyrics_scroll.set)
+        self.lyrics_text.tag_configure("current_lyric", foreground=self.blue2,
+                           font=("Segoe UI Semibold", 12))
+        self.lyrics_text.tag_configure("lyric", foreground=self.text)
+        self.lyrics = None
+        self.lyrics_editing = False
+        self.lyrics_line_index = -1
+        self.lyrics_visible = False
+        self.lyrics_panel.pack_forget()
+
     def window_resized(self, event=None):
         if self.resize_job:
             try:
@@ -1902,7 +1997,17 @@ class MusicVault(tk.Tk):
         self.window_album = tk.Label(win, bg=self.bg, fg=self.muted,
                                      font=("Segoe UI", 9))
         self.window_album.pack(pady=(2, 14))
+        self.window_lyrics_frame = tk.Frame(win, bg=self.panel)
+        self.window_lyrics_text = tk.Text(self.window_lyrics_frame, height=6, wrap="word",
+                          state="disabled", bg=self.panel, fg=self.text,
+                          relief="flat", bd=0, padx=14, pady=10,
+                          font=("Segoe UI", 10), spacing3=4)
+        self.window_lyrics_text.pack(fill="both", expand=True)
+        self.window_lyrics_text.tag_configure("current_lyric", foreground=self.blue2,
+                              font=("Segoe UI Semibold", 11))
+        self.window_lyrics_frame.pack_forget()
         timeline = tk.Frame(win, bg=self.bg)
+        self.window_timeline = timeline
         timeline.pack(fill="x", padx=26, pady=(0, 14))
         self.window_elapsed = tk.Label(timeline, text="0:00", bg=self.bg, fg=self.muted,
                                        font=("Segoe UI", 8))
@@ -1910,6 +2015,7 @@ class MusicVault(tk.Tk):
         self.window_seekbar = ttk.Scale(timeline, from_=0, to=100, orient="horizontal",
                                         variable=self.seek_var, command=self.seek_moving)
         self.window_seekbar.pack(side="left", fill="x", expand=True, padx=10)
+        self.add_tooltip(self.window_seekbar, "Seek through the current track")
         self.window_seekbar.bind("<ButtonPress-1>", self.seek_press)
         self.window_seekbar.bind("<ButtonRelease-1>", self.seek_release)
         self.window_total = tk.Label(timeline, text="0:00", bg=self.bg, fg=self.muted,
@@ -1917,6 +2023,12 @@ class MusicVault(tk.Tk):
         self.window_total.pack(side="right")
         controls = tk.Frame(win, bg=self.bg)
         controls.pack()
+        self.button(controls, "INFO", lambda: self.open_track_details(self.current),
+                bg=self.panel2, padx=9, pady=8,
+                tooltip="Open track details").pack(side="left", padx=3)
+        self.button(controls, "LYRICS", self.toggle_window_lyrics,
+                bg=self.panel2, padx=9, pady=8,
+                tooltip="Show or hide lyrics").pack(side="left", padx=3)
         self.button(controls, "◀◀", self.previous, bg=self.panel2, padx=11, pady=8).pack(side="left", padx=3)
         self.window_play_button = self.button(controls, "▶", self.toggle_play, bg=self.blue,
                               fg="white", width=4, padx=8, pady=8)
@@ -1928,6 +2040,33 @@ class MusicVault(tk.Tk):
                     bg=self.panel2, padx=10, pady=8).pack(side="left", padx=4)
         win.bind("<Configure>", self.now_window_resized, add="+")
         self.refresh_now_window()
+
+    def toggle_window_lyrics(self):
+        if not self.now_window or not self.now_window.winfo_exists():
+            return
+        if not self.lyrics or self.lyrics.get("audio_path") != self.current["path"]:
+            self.load_current_lyrics()
+        if self.window_lyrics_frame.winfo_manager():
+            self.window_lyrics_frame.pack_forget()
+            return
+        self.render_window_lyrics()
+        self.window_lyrics_frame.pack(fill="both", expand=True, padx=26, pady=(0, 14),
+                                      before=self.window_timeline)
+
+    def render_window_lyrics(self):
+        text_widget = getattr(self, "window_lyrics_text", None)
+        if not text_widget:
+            return
+        text_widget.configure(state="normal")
+        text_widget.delete("1.0", "end")
+        if not self.lyrics:
+            text_widget.insert("end", "Lyrics unavailable")
+        elif self.lyrics["lines"]:
+            for _, text in self.lyrics["lines"]:
+                text_widget.insert("end", text + "\n")
+        else:
+            text_widget.insert("end", self.lyrics["plain"] or "Lyrics unavailable")
+        text_widget.configure(state="disabled")
 
     def now_window_resized(self, event=None):
         if self.now_window_resize_job:
@@ -1954,6 +2093,10 @@ class MusicVault(tk.Tk):
         self.window_seekbar.configure(to=max(1, song["duration"]))
         self.window_elapsed.config(text=seconds_text(self.seek_var.get()))
         self.window_total.config(text=seconds_text(song["duration"]))
+        if self.window_lyrics_frame.winfo_manager():
+            if not self.lyrics or self.lyrics.get("audio_path") != song["path"]:
+                self.load_current_lyrics()
+            self.render_window_lyrics()
 
     def show_library_view(self):
         self.player_frame.pack(side="bottom", fill="x")
@@ -1992,6 +2135,102 @@ class MusicVault(tk.Tk):
         self.np_elapsed.config(text=seconds_text(self.seek_var.get()))
         stats = self.db.song_stats(song["id"])
         self.np_stats.config(text=f'{stats["plays"]} plays  •  {seconds_text(song["duration"])}  •  {os.path.splitext(song["path"])[1].upper().lstrip(".")}')
+        self.load_current_lyrics()
+
+    def load_current_lyrics(self):
+        self.lyrics = load_lyrics(self.current["path"]) if self.current else None
+        if self.lyrics:
+            self.lyrics["audio_path"] = self.current["path"]
+        self.lyrics_line_index = -1
+        if not hasattr(self, "lyrics_text"):
+            return
+        self.lyrics_source.config(text=self.lyrics["source"] if self.lyrics else "Lyrics unavailable")
+        self.render_lyrics()
+
+    def set_lyrics_visibility(self, visible):
+        self.lyrics_visible = bool(visible)
+        if not hasattr(self, "lyrics_panel"):
+            return
+        if self.lyrics_visible:
+            if not self.lyrics_panel.winfo_manager():
+                self.lyrics_panel.pack(fill="both", expand=True)
+            self.render_lyrics()
+        else:
+            self.lyrics_panel.pack_forget()
+
+    def toggle_lyrics_visibility(self):
+        self.set_lyrics_visibility(not self.lyrics_visible)
+
+    def render_lyrics(self):
+        if not hasattr(self, "lyrics_text"):
+            return
+        self.lyrics_text.configure(state="normal")
+        self.lyrics_text.delete("1.0", "end")
+        if not self.lyrics:
+            self.lyrics_text.insert("end", "Lyrics unavailable\n\nAdd a .lrc or .txt file beside the audio file, or use Edit to add lyrics.", "lyric")
+        elif self.lyrics["lines"]:
+            for _, text in self.lyrics["lines"]:
+                self.lyrics_text.insert("end", text + "\n", "lyric")
+        else:
+            self.lyrics_text.insert("end", self.lyrics["plain"] or "Lyrics unavailable", "lyric")
+        self.lyrics_text.configure(state="disabled" if not self.lyrics_editing else "normal")
+
+    def edit_lyrics(self):
+        if not self.current or not hasattr(self, "lyrics_text"):
+            return
+        self.lyrics_editing = not self.lyrics_editing
+        self.lyrics_text.configure(state="normal" if self.lyrics_editing else "disabled")
+        if self.lyrics_editing:
+            if self.lyrics and self.lyrics.get("text"):
+                self.lyrics_text.delete("1.0", "end")
+                self.lyrics_text.insert("1.0", self.lyrics["text"])
+            self.lyrics_text.focus_set()
+        else:
+            text = self.lyrics_text.get("1.0", "end-1c")
+            lines, plain = parse_lyrics(text)
+            self.lyrics = {"source": "Edited", "path": self.current["path"],
+                           "audio_path": self.current["path"], "text": text,
+                           "lines": lines, "plain": plain}
+            self.lyrics_source.config(text="Edited")
+
+    def save_lyrics(self):
+        if not self.current or not hasattr(self, "lyrics_text"):
+            return
+        if self.lyrics_editing:
+            self.edit_lyrics()
+        text = self.lyrics_text.get("1.0", "end-1c")
+        target = self.lyrics.get("path") if self.lyrics else None
+        if not target or target == self.current["path"] or not target.lower().endswith((".lrc", ".txt")):
+            target = os.path.splitext(self.current["path"])[0] + ".lrc"
+        try:
+            with open(target, "w", encoding="utf-8") as stream:
+                stream.write(text.rstrip() + "\n")
+            self.lyrics = load_lyrics(self.current["path"])
+            self.lyrics_source.config(text="LRC file")
+            self.render_lyrics()
+            self.status.set(f"Lyrics saved to {os.path.basename(target)}")
+        except OSError as exc:
+            messagebox.showerror("Lyrics save failed", str(exc), parent=self)
+
+    def update_lyrics_position(self, position):
+        if not self.lyrics or not self.lyrics["lines"] or self.lyrics_editing:
+            return
+        index = -1
+        for line_index, (timestamp, _) in enumerate(self.lyrics["lines"]):
+            if timestamp <= position:
+                index = line_index
+            else:
+                break
+        if index == self.lyrics_line_index:
+            return
+        self.lyrics_line_index = index
+        self.lyrics_text.configure(state="normal")
+        self.lyrics_text.tag_remove("current_lyric", "1.0", "end")
+        if index >= 0:
+            start = f"{index + 1}.0"
+            self.lyrics_text.tag_add("current_lyric", start, f"{index + 1}.end")
+            self.lyrics_text.see(start)
+        self.lyrics_text.configure(state="disabled")
 
     def set_view(self, view):
         self.capture_library_state()
@@ -3129,6 +3368,8 @@ class MusicVault(tk.Tk):
                 pos=min(max(0,pos),max(1,self.current["duration"]))
                 self.seek_var.set(pos)
                 self.elapsed.config(text=seconds_text(pos))
+                if hasattr(self, "lyrics_text") and self.now_playing_frame.winfo_manager():
+                    self.update_lyrics_position(pos)
                 if hasattr(self, "np_elapsed") and self.now_playing_frame.winfo_manager():
                     self.np_elapsed.config(text=seconds_text(pos))
                 if self.now_window and self.now_window.winfo_exists():
@@ -3236,9 +3477,11 @@ class MusicVault(tk.Tk):
         m.add_command(label="👎 Dislike",command=lambda:self.set_song_reaction(s,-1))
         m.add_command(label="Clear Like/Dislike",command=lambda:self.set_song_reaction(s,0))
         m.add_separator()
+        rating_menu = tk.Menu(m, tearoff=0, bg=self.panel2, fg=self.text)
         for value in range(1, 6):
-            m.add_command(label=f"{'★' * value} Rate {value}", command=lambda v=value:self.rate_selected(v))
-        m.add_command(label="Clear rating", command=lambda:self.rate_selected(0))
+            rating_menu.add_command(label=f"{'★' * value} {value}", command=lambda v=value:self.rate_selected(v))
+        rating_menu.add_command(label="Clear", command=lambda:self.rate_selected(0))
+        m.add_cascade(label="Rate", menu=rating_menu)
         m.add_command(label="Play",command=self.play_selected)
         m.add_command(label="Play Next",command=lambda:self.play_next_song(s))
         m.add_command(label="Add to Queue",command=lambda:self.add_queue(s))
@@ -3252,6 +3495,9 @@ class MusicVault(tk.Tk):
         m.add_command(label="Open Artist",command=lambda:self.open_artist_page(s))
         m.add_command(label="Edit Metadata",command=lambda:self.edit_metadata(s))
         m.add_command(label="Find Duplicates",command=lambda:self.find_duplicates_for_song(s))
+        lyrics_var = tk.BooleanVar(value=self.lyrics_visible)
+        m.add_checkbutton(label="Show lyrics", variable=lyrics_var,
+                  command=self.toggle_lyrics_visibility)
         m.add_separator()
         for _,name in self.db.playlists():
             m.add_command(label=f"Add to {name}",
