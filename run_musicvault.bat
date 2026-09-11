@@ -27,7 +27,7 @@ if errorlevel 1 (
     exit /b 1
 )
 echo Starting MusicVault...
-%PY% musicvault.py
+%PY% musicvault.py %*
 if errorlevel 1 (
     echo.
     echo MusicVault closed with an error.

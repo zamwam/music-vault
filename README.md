@@ -33,6 +33,17 @@ Spotify-style local music player for Windows.
 - Library Health statistics, safe dead-entry cleanup, Mutagen metadata editing with file backups,
   and on-demand exact-hash/metadata duplicate detection
 - Playlist, queue, favorites, history, resume playback, sorting, and multi-folder scanning
+- Local account dashboard with profile name, optional PIN authentication, favorites, recent plays,
+  likes, dislikes, and quick playback actions
+- Smart views for recently played, liked, never played, top rated, and long tracks
+- Listening-time and top-artist account statistics, toast notifications, sleep timer, crossfade,
+  media-key controls, keyboard shortcut help, and optional Windows system-tray mode
+- Artist, album, and genre browsing surfaces now display grouped entity names instead of generic
+    track rows; unqualified search matches titles only, while operators target metadata fields
+- Configurable navigation visibility with a compact default order, selectable interface fonts,
+    default initials avatars, cropped profile-picture uploads, and opt-in automatic album-art downloads
+- Developer startup flags: `--dev`, `--debug`, `--no-scan`, `--no-auth`, `--view Account`,
+  `--profile-name "Name"`, and `--data-dir PATH`
 
 ## Architecture
 
@@ -53,5 +64,8 @@ Use the right-click menu for details and management actions.
 2. Run `run_musicvault.bat`.
 3. Open Settings and add your music folders.
 4. Click Save & Scan.
+
+For example, a developer can run an isolated profile without scanning or authentication:
+`run_musicvault.bat --dev --no-scan --no-auth --data-dir .\\.musicvault-dev --view Account`
 
 Dependencies are installed automatically by the launcher.

@@ -1,5 +1,9 @@
 import os
 import sys
+import argparse
+import base64
+import binascii
+import hashlib
 import io
 import json
 import time
@@ -9,6 +13,8 @@ import shutil
 import sqlite3
 import threading
 import subprocess
+import urllib.parse
+import urllib.request
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
@@ -27,11 +33,38 @@ try:
 except ImportError:
     Image = ImageTk = ImageDraw = None
 
+try:
+    import pystray
+    from PIL import Image as TrayImage
+except ImportError:
+    pystray = None
+    TrayImage = None
+
 
 APP_NAME = "MusicVault"
 DATA_DIR = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), APP_NAME)
 DB_FILE = os.path.join(DATA_DIR, "musicvault.db")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+
+
+def parse_startup_args(argv=None):
+    parser = argparse.ArgumentParser(description="MusicVault local music player")
+    parser.add_argument("--dev", action="store_true", help="Enable developer-friendly diagnostics")
+    parser.add_argument("--debug", action="store_true", help="Print startup diagnostics")
+    parser.add_argument("--no-scan", action="store_true", help="Skip the automatic startup scan")
+    parser.add_argument("--no-auth", action="store_true", help="Skip local profile PIN authentication")
+    parser.add_argument("--profile-name", help="Use a profile name for this session")
+    parser.add_argument("--view", choices=["Home", "Songs", "Albums", "Artists", "Genres",
+                                            "Recently Added", "Recently Played", "Most Played", "Favorites",
+                                            "Liked Songs", "Never Played", "Top Rated", "Long Tracks",
+                                            "5 Star Songs", "Library Health", "Account"],
+                        help="Open a specific view")
+    parser.add_argument("--data-dir", help="Override the MusicVault data directory")
+    return parser.parse_args(argv)
+
+
+def profile_pin_hash(pin):
+    return hashlib.sha256(str(pin).encode("utf-8")).hexdigest()
 
 EXTENSIONS = {
     ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus",
@@ -74,6 +107,18 @@ def load_settings():
         "shuffle_mode": "Random",
         "crossfade": 0,
         "sleep_timer": 0,
+        "profile": {"name": "Local Listener", "pin_hash": ""},
+        "confirm_exit": False,
+        "show_account_summary": True,
+        "minimize_to_tray": False,
+        "crossfade_seconds": 0,
+        "toast_notifications": True,
+        "media_keys": True,
+        "visible_nav": ["Home", "Songs", "Albums", "Artists", "Genres", "Favorites",
+                        "Never Played", "Account", "Library Health"],
+        "font_family": "Segoe UI",
+        "auto_download_artwork": False,
+        "profile": {"name": "Local Listener", "pin_hash": "", "avatar": None},
     }
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
@@ -120,6 +165,23 @@ def seconds_text(v):
     except Exception:
         v = 0
     return f"{v // 60}:{v % 60:02d}"
+
+
+def rating_text(value):
+    try:
+        value = max(0, min(5, int(value or 0)))
+    except (TypeError, ValueError):
+        value = 0
+    return "★" * value + "☆" * (5 - value)
+
+
+def blend_color(start, end, amount):
+    start = start.lstrip("#")
+    end = end.lstrip("#")
+    channels = [round(int(start[index:index + 2], 16) * (1 - amount)
+                      + int(end[index:index + 2], 16) * amount)
+                for index in (0, 2, 4)]
+    return "#" + "".join(f"{channel:02x}" for channel in channels)
 
 
 def metadata(path):
@@ -186,7 +248,7 @@ def metadata(path):
     return d
 
 
-class DB:
+class _LegacyDB:
     def __init__(self):
         ensure_data()
         self.con = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -506,13 +568,23 @@ from organizer import apply_plan, build_plan
 
 
 class MusicVault(tk.Tk):
-    def __init__(self):
+    def __init__(self, startup=None):
         super().__init__()
+        self.startup = startup or parse_startup_args([])
         self.settings = load_settings()
+        profile = self.settings.get("profile", {})
+        self.profile = profile if isinstance(profile, dict) else {"name": "Local Listener", "pin_hash": ""}
+        if getattr(self.startup, "profile_name", None):
+            self.profile["name"] = self.startup.profile_name
         self.db = DB(DB_FILE, DATA_DIR)
 
-        self.blue = "#3b82f6"
-        self.blue2 = "#60a5fa"
+        accents = {
+            "blue": ("#3b82f6", "#60a5fa"),
+            "teal": ("#0d9488", "#5eead4"),
+            "gold": ("#d97706", "#fbbf24"),
+            "rose": ("#e11d48", "#fb7185"),
+        }
+        self.blue, self.blue2 = accents.get(self.settings.get("accent", "blue"), accents["blue"])
         self.bg = "#080b10"
         self.panel = "#10151d"
         self.panel2 = "#171e28"
@@ -520,14 +592,19 @@ class MusicVault(tk.Tk):
         self.text = "#f4f7fb"
         self.muted = "#8996a6"
         self.border = "#293341"
+        self.font_family = self.settings.get("font_family", "Segoe UI")
+        self.option_add("*Font", (self.font_family, 10))
 
         self.title("MusicVault")
         self.geometry("1350x850")
-        self.minsize(980, 650)
+        self.minsize(680, 520)
         self.configure(bg=self.bg)
+        self.icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "image.png")
+        self.icon_ref = None
+        self.apply_app_icon()
         self.protocol("WM_DELETE_WINDOW", self.close)
 
-        self.view = self.settings.get("startup_view", "Home")
+        self.view = getattr(self.startup, "view", None) or self.settings.get("startup_view", "Home")
         self.playlist_name = None
         self.visible = []
         self.library_view_state = {}
@@ -551,6 +628,7 @@ class MusicVault(tk.Tk):
         self.art_ref = None
         self.album_art_cache = {}
         self.library_cache = None
+        self.rating_cache = None
         self.refresh_job = None
         self.render_job = None
         self.render_generation = 0
@@ -569,25 +647,47 @@ class MusicVault(tk.Tk):
         self.details_window = None
         self.now_window = None
         self.now_window_resize_job = None
+        self.account_frame = None
+        self.tray_icon = None
+        self.sleep_timer_end = None
+        self.toast_job = None
+        self.transition_pending = False
+        self.sidebar_visible = True
+        self.responsive_job = None
+        self.last_compact_layout = False
         self.shuffle = bool(self.settings.get("shuffle", False)) if self.settings.get("remember_shuffle", True) else False
         self.repeat = self.settings.get("repeat", "off") if self.settings.get("remember_repeat", True) else "off"
 
         self.search = tk.StringVar()
         self.search.trace_add("write", lambda *_: self.schedule_refresh())
         self.sort_var = tk.StringVar(value=self.settings.get("sort", "Title"))
+        self.quick_filter = tk.StringVar(value="All")
 
+        if not getattr(self.startup, "no_auth", False) and not self.authenticate_profile():
+            self.destroy()
+            raise SystemExit(0)
         self.init_audio()
         self.style_widgets()
         self.build()
         self.bind("<Configure>", self.window_resized, add="+")
+        self.after_idle(self.adapt_layout)
         self.refresh_playlists()
         self.view_title.config(text=self.view)
+        for name in ["Home", "Songs", "Albums", "Artists", "Genres", "Recently Added", "Recently Played",
+                 "Most Played", "Favorites", "Liked Songs", "Never Played", "Top Rated", "Long Tracks",
+                 "5 Star Songs", "Library Health", "Account"]:
+            button = getattr(self, "nav_" + name.lower().replace(" ", "_"), None)
+            if button:
+                button.configure(bg=self.hover if self.view == name else self.panel,
+                                 fg=self.blue2 if self.view == name else self.text)
         if self.view == "Home":
             self.show_home_view()
+        elif self.view == "Account":
+            self.show_account_page()
         else:
             self.show_library_view()
 
-        if self.settings.get("auto_scan", True):
+        if self.settings.get("auto_scan", True) and not getattr(self.startup, "no_scan", False):
             self.after(600, self.start_scan)
 
         self.after(250, self.player_tick)
@@ -603,6 +703,204 @@ class MusicVault(tk.Tk):
         self.bind_all("<Control-Shift-L>", lambda e: self.like_current())
         self.bind_all("<Control-Shift-D>", lambda e: self.dislike_current())
         self.bind_all("<KeyPress>", self.rating_key)
+        self.bind_all("<Control-Shift-S>", lambda e: self.open_sleep_timer())
+        self.bind_all("<Control-slash>", lambda e: self.show_shortcuts())
+        if self.settings.get("media_keys", True):
+            self.bind_all("<XF86AudioPlay>", lambda e: self.toggle_play())
+            self.bind_all("<XF86AudioNext>", lambda e: self.next())
+            self.bind_all("<XF86AudioPrev>", lambda e: self.previous())
+
+    def authenticate_profile(self):
+        pin_hash = self.profile.get("pin_hash", "")
+        if not pin_hash:
+            return True
+        self.withdraw()
+        for _ in range(3):
+            pin = simpledialog.askstring("MusicVault", "Enter your profile PIN:",
+                                         parent=self, show="*")
+            if pin is None:
+                self.deiconify()
+                return False
+            if profile_pin_hash(pin) == pin_hash:
+                self.deiconify()
+                return True
+            messagebox.showwarning("Profile locked", "That PIN did not match.", parent=self)
+        self.deiconify()
+        messagebox.showerror("Profile locked", "Too many incorrect attempts.", parent=self)
+        return False
+
+    def toast(self, message):
+        self.status.set(message)
+        if not self.settings.get("toast_notifications", True):
+            return
+        if hasattr(self, "toast_frame") and self.toast_frame.winfo_exists():
+            self.toast_frame.destroy()
+        self.toast_frame = tk.Frame(self, bg=self.blue,
+                                    highlightbackground=self.blue2, highlightthickness=1)
+        tk.Label(self.toast_frame, text=message, bg=self.blue, fg="white",
+                 font=("Segoe UI Semibold", 9)).pack(padx=16, pady=9)
+        self.toast_frame.place(relx=1, rely=1, x=-22, y=-150, anchor="se")
+        if self.toast_job:
+            self.after_cancel(self.toast_job)
+        self.toast_job = self.after(2800, self.toast_frame.destroy)
+
+    def show_shortcuts(self):
+        messagebox.showinfo(
+            "Keyboard shortcuts",
+            "Space  Play / pause\nCtrl+F  Focus search\nCtrl+L  Scan library\n"
+            "Ctrl+I  Track details\nLeft / Right  Previous / next\n"
+            "1-5  Rate current song\nCtrl+Shift+S  Sleep timer\nCtrl+/  This list",
+            parent=self,
+        )
+
+    def open_sleep_timer(self):
+        value = simpledialog.askinteger("Sleep timer", "Stop playback after how many minutes?\nUse 0 to cancel.",
+                                        initialvalue=0, minvalue=0, maxvalue=1440, parent=self)
+        if value is None:
+            return
+        if value == 0:
+            self.sleep_timer_end = None
+            self.toast("Sleep timer cancelled")
+            return
+        self.sleep_timer_end = time.monotonic() + value * 60
+        self.toast(f"Sleep timer set for {value} minute(s)")
+
+    def create_tray_icon(self):
+        if pystray is None or TrayImage is None:
+            self.toast("Install pystray to enable the system tray")
+            return False
+        if self.tray_icon:
+            return True
+        try:
+            image = TrayImage.open(self.icon_path).convert("RGBA")
+            image.thumbnail((64, 64), Image.Resampling.LANCZOS)
+            tray_image = TrayImage.new("RGBA", (64, 64), (0, 0, 0, 0))
+            tray_image.alpha_composite(
+                image, ((64 - image.width) // 2, (64 - image.height) // 2))
+            image = tray_image
+        except (OSError, AttributeError):
+            image = TrayImage.new("RGB", (64, 64), self.blue)
+        menu = pystray.Menu(
+            pystray.MenuItem("Open MusicVault", lambda: self.after(0, self.restore_from_tray)),
+            pystray.MenuItem("Play / Pause", lambda: self.after(0, self.toggle_play)),
+            pystray.MenuItem("Next", lambda: self.after(0, self.next)),
+            pystray.MenuItem("Exit", lambda: self.after(0, self.exit_from_tray)),
+        )
+        self.tray_icon = pystray.Icon("musicvault", image, "MusicVault", menu)
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+        return True
+
+    def minimize_to_tray(self):
+        if self.create_tray_icon():
+            self.withdraw()
+            self.toast("MusicVault is running in the system tray")
+            return True
+        return False
+
+    def restore_from_tray(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def exit_from_tray(self):
+        self.closing = True
+        if self.tray_icon:
+            self.tray_icon.stop()
+            self.tray_icon = None
+        self.close()
+
+    def set_profile_pin(self):
+        current = self.profile.get("pin_hash", "")
+        if current:
+            old_pin = simpledialog.askstring("Change PIN", "Current PIN:", parent=self, show="*")
+            if old_pin is None or profile_pin_hash(old_pin) != current:
+                messagebox.showwarning("Profile", "The current PIN was not accepted.", parent=self)
+                return
+        new_pin = simpledialog.askstring("Profile PIN", "New PIN (leave blank to disable):",
+                                         parent=self, show="*")
+        if new_pin is None:
+            return
+        self.profile["pin_hash"] = profile_pin_hash(new_pin) if new_pin else ""
+        self.settings["profile"] = self.profile
+        save_settings(self.settings)
+        self.status.set("Profile PIN updated")
+
+    def choose_profile_picture(self):
+        if Image is None:
+            self.toast("Install Pillow to add a profile picture")
+            return
+        path = filedialog.askopenfilename(parent=self, title="Choose profile picture",
+                                          filetypes=[("Images", "*.png *.jpg *.jpeg *.webp"),
+                                                     ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            source = Image.open(path).convert("RGB")
+            side = min(source.size)
+            max_left = source.width - side
+            max_top = source.height - side
+            win = tk.Toplevel(self)
+            win.title("Crop profile picture")
+            win.configure(bg=self.bg)
+            win.transient(self)
+            preview = tk.Label(win, bg=self.panel2)
+            preview.pack(padx=18, pady=(18, 8))
+            x_var = tk.IntVar(value=max_left // 2)
+            y_var = tk.IntVar(value=max_top // 2)
+
+            def render_crop(*_):
+                cropped = source.crop((x_var.get(), y_var.get(), x_var.get() + side,
+                                       y_var.get() + side)).resize((240, 240))
+                photo = ImageTk.PhotoImage(cropped)
+                preview.configure(image=photo)
+                preview.image = photo
+
+            render_crop()
+            if max_left:
+                tk.Scale(win, from_=0, to=max_left, variable=x_var, orient="horizontal",
+                         label="Horizontal crop", bg=self.bg, fg=self.text,
+                         troughcolor=self.panel2, highlightthickness=0,
+                         command=render_crop).pack(fill="x", padx=18)
+            if max_top:
+                tk.Scale(win, from_=0, to=max_top, variable=y_var, orient="horizontal",
+                         label="Vertical crop", bg=self.bg, fg=self.text,
+                         troughcolor=self.panel2, highlightthickness=0,
+                         command=render_crop).pack(fill="x", padx=18)
+
+            def save_crop():
+                cropped = source.crop((x_var.get(), y_var.get(), x_var.get() + side,
+                                       y_var.get() + side)).resize((256, 256))
+                stream = io.BytesIO()
+                cropped.save(stream, format="PNG")
+                self.profile["avatar"] = base64.b64encode(stream.getvalue()).decode("ascii")
+                self.settings["profile"] = self.profile
+                save_settings(self.settings)
+                win.destroy()
+                self.toast("Profile picture updated")
+                if self.view == "Account":
+                    self.show_account_page()
+
+            self.button(win, "Save Picture", save_crop, bg=self.blue, fg="white",
+                        padx=14, pady=7).pack(pady=(8, 18))
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Profile picture", str(exc), parent=self)
+
+    def profile_art(self, size=72):
+        if Image is None:
+            return None
+        try:
+            raw = self.profile.get("avatar")
+            if raw:
+                image = Image.open(io.BytesIO(base64.b64decode(raw))).convert("RGB")
+            else:
+                image = Image.new("RGB", (size, size), self.blue)
+                initials = "".join(part[0] for part in self.profile.get("name", "MV").split()[:2]).upper()
+                ImageDraw.Draw(image).text((size // 2, size // 2), initials or "MV",
+                                           fill="white", anchor="mm", font=None)
+            image = image.resize((size, size))
+            return ImageTk.PhotoImage(image)
+        except (OSError, ValueError, binascii.Error):
+            return None
 
     def init_audio(self):
         if pygame:
@@ -613,22 +911,40 @@ class MusicVault(tk.Tk):
             except Exception:
                 pass
 
+    def apply_app_icon(self):
+        if not os.path.isfile(self.icon_path):
+            return
+        try:
+            if Image is not None and ImageTk is not None:
+                image = Image.open(self.icon_path).convert("RGBA")
+                self.icon_ref = ImageTk.PhotoImage(image)
+            else:
+                self.icon_ref = tk.PhotoImage(file=self.icon_path)
+            self.iconphoto(True, self.icon_ref)
+        except (OSError, tk.TclError):
+            self.icon_ref = None
+
     def style_widgets(self):
         s = ttk.Style(self)
         try:
             s.theme_use("clam")
         except Exception:
             pass
+        s.configure("Modern.TCombobox", fieldbackground=self.panel2,
+                    background=self.panel2, foreground=self.text,
+                    bordercolor=self.border, lightcolor=self.panel2,
+                    darkcolor=self.panel2, arrowcolor=self.blue2)
         s.configure("Treeview", background=self.panel, fieldbackground=self.panel,
                     foreground=self.text,
-                    rowheight=34 if self.settings.get("density", "Comfortable") == "Compact" else 44,
+                    rowheight=32 if self.settings.get("density", "Comfortable") == "Compact" else 40,
                     borderwidth=0,
                     font=("Segoe UI", 10))
-        s.map("Treeview", background=[("selected", "#2458a6")],
+        s.map("Treeview", background=[("selected", self.blue)],
               foreground=[("selected", "#ffffff")])
+        s.configure("Treeview", insertwidth=0)
         s.configure("Treeview.Heading", background=self.panel2, foreground=self.muted,
                     font=("Segoe UI Semibold", 9), borderwidth=0)
-        s.configure("Horizontal.TScale", background=self.panel)
+        s.configure("Horizontal.TScale", background=self.panel, troughcolor=self.panel2)
         s.configure("Vertical.TScrollbar", troughcolor=self.panel,
                     background=self.panel2, bordercolor=self.panel)
         s.configure("Horizontal.TScrollbar", troughcolor=self.panel,
@@ -641,55 +957,124 @@ class MusicVault(tk.Tk):
             parent, text=text, command=command, bg=background,
             fg=kw.pop("fg", self.text), activebackground=kw.pop("activebackground", self.hover),
             activeforeground=kw.pop("activeforeground", self.text),
-            relief="flat", bd=0, cursor="hand2", **kw
+            relief="flat", bd=0, cursor="hand2", highlightthickness=0, **kw
         )
-        button.bind("<Enter>", lambda event: button.configure(bg=hover_background), add="+")
-        button.bind("<Leave>", lambda event: button.configure(bg=background), add="+")
+        animation_job = None
+
+        def animate(target):
+            nonlocal animation_job
+            if animation_job:
+                try:
+                    self.after_cancel(animation_job)
+                except tk.TclError:
+                    pass
+            current = button.cget("bg")
+            try:
+                current = current if str(current).startswith("#") else background
+                start_rgb = current
+            except tk.TclError:
+                return
+            def step(index=0):
+                nonlocal animation_job
+                try:
+                    if not button.winfo_exists():
+                        return
+                    button.configure(bg=blend_color(start_rgb, target, (index + 1) / 5))
+                    if index < 4:
+                        animation_job = self.after(18, lambda: step(index + 1))
+                    else:
+                        animation_job = None
+                except tk.TclError:
+                    animation_job = None
+            step()
+
+        button.bind("<Enter>", lambda event: animate(hover_background), add="+")
+        button.bind("<Leave>", lambda event: animate(background), add="+")
         return button
 
     def build(self):
-        header = tk.Frame(self, bg=self.bg, height=72)
+        header = tk.Frame(self, bg=self.panel, height=68,
+                  highlightbackground=self.border, highlightthickness=1)
+        self.header = header
         header.pack(fill="x")
         header.pack_propagate(False)
 
-        tk.Label(header, text="♫", bg=self.bg, fg=self.blue2,
-                 font=("Segoe UI Semibold", 27)).pack(side="left", padx=(22,6))
-        tk.Label(header, text="MusicVault", bg=self.bg, fg=self.text,
-                 font=("Segoe UI Semibold", 19)).pack(side="left")
+        brand = tk.Frame(header, bg=self.panel)
+        brand.pack(side="left", padx=(22, 28))
+        tk.Label(brand, text="MV", bg=self.blue, fg="white", width=3,
+             font=("Segoe UI Semibold", 13)).pack(side="left", padx=(0, 10), pady=14)
+        brand_copy = tk.Frame(brand, bg=self.panel)
+        brand_copy.pack(side="left")
+        tk.Label(brand_copy, text="MUSICVAULT", bg=self.panel, fg=self.text,
+             font=("Segoe UI Semibold", 12)).pack(anchor="w")
+        tk.Label(brand_copy, text="LOCAL AUDIO LIBRARY", bg=self.panel, fg=self.muted,
+             font=("Segoe UI", 7)).pack(anchor="w")
 
-        search_wrap = tk.Frame(header, bg=self.panel2)
-        search_wrap.pack(side="left", padx=28, ipady=1)
-        tk.Label(search_wrap, text="⌕", bg=self.panel2, fg=self.muted,
-                 font=("Segoe UI", 15)).pack(side="left", padx=(10,2))
+        search_wrap = tk.Frame(header, bg=self.panel2,
+                       highlightbackground=self.border, highlightthickness=1)
+        search_wrap.pack(side="left", fill="x", expand=True, padx=(0, 18), pady=13)
+        tk.Label(search_wrap, text="SEARCH", bg=self.panel2, fg=self.blue2,
+             font=("Segoe UI Semibold", 8)).pack(side="left", padx=(12, 8))
         self.search_entry = tk.Entry(
             search_wrap, textvariable=self.search, bg=self.panel2, fg=self.text,
             insertbackground=self.text, relief="flat", width=43,
             font=("Segoe UI", 10)
         )
-        self.search_entry.pack(side="left", ipady=9, padx=(0,10))
+        self.search_entry.pack(side="left", fill="x", expand=True, ipady=7, padx=(0, 12))
 
-        self.button(header, "↻ Scan", self.start_scan, bg=self.panel2,
-                    padx=13, pady=8).pack(side="right", padx=8)
-        self.button(header, "⚙ Settings", self.settings_window, bg=self.panel2,
-                    padx=13, pady=8).pack(side="right", padx=(8,18))
+        self.header_buttons = []
+        for label, command, background, foreground in (
+            ("SCAN", self.start_scan, self.blue, "white"),
+            ("SETTINGS", self.settings_window, self.panel2, self.text),
+            ("PROFILE", lambda: self.set_view("Account"), self.panel2, self.text),
+            ("TIMER", self.open_sleep_timer, self.panel2, self.text)):
+            control = self.button(header, label, command, bg=background, fg=foreground,
+                      padx=12, pady=7)
+            control.pack(side="right", padx=8, pady=13)
+            self.header_buttons.append(control)
+        self.menu_button = self.button(header, "MENU", self.toggle_sidebar,
+                           bg=self.panel2, padx=12, pady=7)
+        self.menu_button.pack_forget()
 
         main = tk.Frame(self, bg=self.bg)
         main.pack(fill="both", expand=True)
 
-        side = tk.Frame(main, bg=self.panel, width=225)
+        side = tk.Frame(main, bg=self.panel, width=238,
+                highlightbackground=self.border, highlightthickness=1)
+        self.main = main
+        self.side = side
         side.pack(side="left", fill="y")
         side.pack_propagate(False)
-        tk.Label(side, text="BROWSE", bg=self.panel, fg=self.muted,
-                 font=("Segoe UI Semibold", 9)).pack(anchor="w", padx=20, pady=(20,7))
+        self.side_canvas = tk.Canvas(side, bg=self.panel, highlightthickness=0,
+                                     bd=0, yscrollincrement=18)
+        self.side_inner = tk.Frame(self.side_canvas, bg=self.panel)
+        self.side_window = self.side_canvas.create_window((0, 0), window=self.side_inner,
+                                                          anchor="nw")
+        self.side_inner.bind("<Configure>", lambda event: self.side_canvas.configure(
+            scrollregion=self.side_canvas.bbox("all")))
+        self.side_canvas.bind("<Configure>", lambda event: self.side_canvas.itemconfigure(
+            self.side_window, width=event.width))
+        self.side_canvas.pack(fill="both", expand=True)
+        self.bind_scroll_wheel(self.side_canvas, self.side_canvas)
+        self.bind_scroll_wheel(self.side_inner, self.side_canvas)
 
-        for name in ["Home","Songs","Albums","Artists","Genres","Recently Added","Most Played","Favorites","5 Star Songs","Library Health"]:
-            self.nav_button(side, name)
+        tk.Label(self.side_inner, text="WORKSPACE", bg=self.panel, fg=self.muted,
+             font=("Segoe UI Semibold", 8)).pack(anchor="w", padx=18, pady=(22, 9))
 
-        tk.Label(side, text="YOUR PLAYLISTS", bg=self.panel, fg=self.muted,
-                 font=("Segoe UI Semibold", 9)).pack(anchor="w", padx=20, pady=(24,7))
+        nav_order = ["Home", "Songs", "Albums", "Artists", "Genres", "Favorites",
+                     "Never Played", "Account", "Library Health", "Recently Added",
+                     "Recently Played", "Most Played", "Liked Songs", "Top Rated",
+                     "Long Tracks", "5 Star Songs"]
+        visible_nav = self.settings.get("visible_nav", nav_order[:9])
+        for name in nav_order:
+            if name in visible_nav:
+                self.nav_button(self.side_inner, name)
 
-        pf = tk.Frame(side, bg=self.panel)
-        pf.pack(fill="both", expand=True)
+        tk.Label(self.side_inner, text="COLLECTIONS", bg=self.panel, fg=self.muted,
+             font=("Segoe UI Semibold", 8)).pack(anchor="w", padx=18, pady=(24, 9))
+
+        pf = tk.Frame(self.side_inner, bg=self.panel)
+        pf.pack(fill="x")
         self.playlist_canvas = tk.Canvas(pf, bg=self.panel, highlightthickness=0)
         self.playlist_scroll = ttk.Scrollbar(pf, orient="vertical", command=self.playlist_canvas.yview)
         self.playlist_inner = tk.Frame(self.playlist_canvas, bg=self.panel)
@@ -704,30 +1089,32 @@ class MusicVault(tk.Tk):
         self.playlist_canvas.pack(side="left", fill="both", expand=True)
         self.playlist_scroll.pack(side="right", fill="y")
 
-        self.button(side, "+ New Playlist", self.new_playlist, bg=self.panel,
-                    fg=self.blue2, anchor="w", padx=20, pady=10).pack(fill="x", side="bottom")
+        self.button(self.side_inner, "+  NEW PLAYLIST", self.new_playlist, bg=self.panel2,
+                fg=self.blue2, anchor="w", padx=18, pady=10).pack(fill="x", side="bottom", padx=10, pady=12)
 
         content = tk.Frame(main, bg=self.bg)
         self.content = content
-        content.pack(side="left", fill="both", expand=True, padx=20, pady=14)
+        content.pack(side="left", fill="both", expand=True, padx=26, pady=22)
 
         top = tk.Frame(content, bg=self.bg)
         top.pack(fill="x")
         self.view_title = tk.Label(top, text="Home", bg=self.bg, fg=self.text,
-                                   font=("Segoe UI Semibold", 26))
+                                   font=("Segoe UI Semibold", 25))
         self.view_title.pack(side="left")
 
         self.count = tk.Label(top, text="", bg=self.bg, fg=self.muted,
-                              font=("Segoe UI", 9))
-        self.count.pack(side="left", padx=12, pady=(9,0))
+                              font=("Segoe UI", 9), padx=10, pady=3)
+        self.count.pack(side="left", padx=12, pady=(8, 0))
 
         sortbox = tk.Frame(top, bg=self.bg)
+        self.sortbox = sortbox
         sortbox.pack(side="right")
-        tk.Label(sortbox, text="Sort", bg=self.bg, fg=self.muted).pack(side="left", padx=6)
+        tk.Label(sortbox, text="SORT BY", bg=self.bg, fg=self.muted,
+             font=("Segoe UI Semibold", 8)).pack(side="left", padx=8)
         self.sort_combo = ttk.Combobox(
             sortbox, textvariable=self.sort_var,
             values=["Title","Artist","Album","Year","Rating","Duration","Date Added"],
-            state="readonly", width=14
+            state="readonly", width=14, style="Modern.TCombobox"
         )
         self.sort_combo.pack(side="left")
         self.sort_combo.bind("<<ComboboxSelected>>", lambda e: self.sort_changed())
@@ -737,21 +1124,46 @@ class MusicVault(tk.Tk):
         self.album_strip.pack_propagate(False)
 
         actions = tk.Frame(content, bg=self.bg)
-        actions.pack(fill="x", pady=(0,8))
-        self.button(actions,"▶ Play",self.play_selected,bg=self.blue,fg="white",
-                    padx=13,pady=6).pack(side="left",padx=(0,6))
-        self.button(actions,"⤨ Shuffle",self.toggle_shuffle,bg=self.panel2,
-                    padx=13,pady=6).pack(side="left",padx=6)
-        self.button(actions,"♡ Favorite",self.toggle_selected_favorite,bg=self.panel2,
-                    padx=13,pady=6).pack(side="left",padx=6)
-        self.button(actions,"👍 Like",self.like_selected,bg=self.panel2,
-                    padx=13,pady=6).pack(side="left",padx=6)
-        self.button(actions,"👎 Dislike",self.dislike_selected,bg=self.panel2,
-                    padx=13,pady=6).pack(side="left",padx=6)
-        self.button(actions,"＋ Queue",self.queue_selected,bg=self.panel2,
-                    padx=13,pady=6).pack(side="left",padx=6)
+        actions.pack(fill="x", pady=(0, 12))
+        self.action_tabs = actions
+        self.action_buttons = []
+        for index, (label, command, background, foreground) in enumerate((
+            ("PLAY SELECTED", self.play_selected, self.blue, "white"),
+            ("SHUFFLE", self.toggle_shuffle, self.panel2, self.text),
+            ("FAVORITE", self.toggle_selected_favorite, self.panel2, self.text),
+            ("LIKE", self.like_selected, self.panel2, self.text),
+            ("DISLIKE", self.dislike_selected, self.panel2, self.text),
+            ("QUEUE", self.queue_selected, self.panel2, self.text))):
+            control = self.button(
+                actions, label,
+                lambda action=command, tab=index: self.run_action_tab(action, tab),
+                bg=background, fg=foreground, padx=12, pady=7,
+                font=("Segoe UI Semibold", 8),
+            )
+            control.pack(side="left", padx=4)
+            self.action_buttons.append(control)
+        self.active_action_tab = 0
 
-        table = tk.Frame(content, bg=self.panel)
+        filters = tk.Frame(content, bg=self.bg)
+        self.quick_filter_bar = filters
+        filters.pack(fill="x", pady=(0, 10))
+        tk.Label(filters, text="QUICK FILTERS", bg=self.bg, fg=self.muted,
+                 font=("Segoe UI Semibold", 8)).pack(side="left", padx=(0, 10))
+        self.quick_filter_buttons = []
+        for label in ("All", "Favorites", "Liked", "Rated", "Unplayed", "Long Tracks"):
+            button = self.button(
+                filters, label,
+                lambda value=label: self.set_quick_filter(value),
+                bg=self.blue if label == "All" else self.panel2,
+                fg="white" if label == "All" else self.muted,
+                padx=10, pady=4, font=("Segoe UI Semibold", 8),
+            )
+            button.pack(side="left", padx=(0, 5))
+            self.quick_filter_buttons.append(button)
+
+        table = tk.Frame(content, bg=self.panel,
+                 highlightbackground=self.border, highlightthickness=1)
+        self.library_table = table
         table.pack(fill="both", expand=True)
         cols = ("title","artist","album","genre","year","rating","time")
         self.tree = ttk.Treeview(table, columns=cols, show="headings", selectmode="extended")
@@ -770,9 +1182,13 @@ class MusicVault(tk.Tk):
         table.columnconfigure(0,weight=1)
         self.tree.bind("<Double-1>", self.play_selected)
         self.tree.bind("<Return>", self.play_selected)
+        self.tree.bind("<<TreeviewSelect>>", self.selection_changed)
         self.tree.bind("<Button-3>", self.context_menu)
+        self.tree.tag_configure("stripe", background="#131a24")
+        self.tree.tag_configure("rated", foreground="#fbbf24")
+        self.tree.tag_configure("current", background="#12304a", foreground="#e0f2fe")
 
-        self.library_widgets = [top, self.album_strip, actions, table]
+        self.library_widgets = [top, self.album_strip, actions, filters, table]
         self.build_player()
         self.build_queue_panel(main)
         self.build_now_playing_page(content)
@@ -782,13 +1198,87 @@ class MusicVault(tk.Tk):
         self.status_label=tk.Label(self, textvariable=self.status, bg=self.bg, fg=self.muted,
                  font=("Segoe UI",8))
         if self.settings.get("show_status_bar",True):
-            self.status_label.place(x=240,y=53)
+            self.status_label.pack(side="bottom", fill="x", padx=12, pady=(0, 3))
+
+    def run_action_tab(self, action, tab):
+        self.active_action_tab = tab
+        for index, button in enumerate(self.action_buttons):
+            active = index == tab
+            button.configure(bg=self.blue if active else self.panel2,
+                             fg="white" if active else self.text)
+        action()
+
+    def animate_panel_focus(self, widget, delay=0):
+        def pulse(step=0):
+            try:
+                if not widget.winfo_exists():
+                    return
+                if step <= 5:
+                    widget.configure(highlightthickness=1,
+                                     highlightbackground=blend_color(self.border, self.blue2, step / 5))
+                elif step <= 10:
+                    widget.configure(highlightbackground=blend_color(
+                        self.blue2, self.border, (step - 5) / 5))
+                else:
+                    widget.configure(highlightthickness=0)
+                    return
+                self.after(24, lambda: pulse(step + 1))
+            except tk.TclError:
+                return
+        self.after(delay, pulse)
+
+    def set_quick_filter(self, value):
+        self.quick_filter.set(value)
+        for button, label in zip(self.quick_filter_buttons,
+                                 ("All", "Favorites", "Liked", "Rated", "Unplayed", "Long Tracks")):
+            active = label == value
+            button.configure(bg=self.blue if active else self.panel2,
+                             fg="white" if active else self.muted)
+        self.refresh()
 
     def nav_button(self, side, name):
         b = self.button(side, name, lambda n=name: self.set_view(n),
-                        bg=self.panel, anchor="w", padx=20, pady=9)
-        b.pack(fill="x")
+                        bg=self.panel, anchor="w", padx=18, pady=8,
+                        font=("Segoe UI Semibold", 9), activebackground=self.hover)
+        b.pack(fill="x", padx=8, pady=1)
+        b.bind("<Leave>", lambda event, button=b, item=name: button.configure(
+            bg=self.hover if self.view == item else self.panel,
+            fg=self.blue2 if self.view == item else self.text), add="+")
         setattr(self, "nav_" + name.lower().replace(" ","_"), b)
+
+    def rebuild_navigation(self):
+        for child in self.side_inner.winfo_children():
+            child.destroy()
+        tk.Label(self.side_inner, text="WORKSPACE", bg=self.panel, fg=self.muted,
+                 font=("Segoe UI Semibold", 8)).pack(anchor="w", padx=18, pady=(22, 9))
+        nav_order = ["Home", "Songs", "Albums", "Artists", "Genres", "Favorites",
+                     "Never Played", "Account", "Library Health", "Recently Added",
+                     "Recently Played", "Most Played", "Liked Songs", "Top Rated",
+                     "Long Tracks", "5 Star Songs"]
+        visible_nav = self.settings.get("visible_nav", nav_order[:9])
+        for name in nav_order:
+            if name in visible_nav:
+                self.nav_button(self.side_inner, name)
+        tk.Label(self.side_inner, text="COLLECTIONS", bg=self.panel, fg=self.muted,
+                 font=("Segoe UI Semibold", 8)).pack(anchor="w", padx=18, pady=(24, 9))
+        pf = tk.Frame(self.side_inner, bg=self.panel)
+        pf.pack(fill="x")
+        self.playlist_canvas = tk.Canvas(pf, bg=self.panel, highlightthickness=0)
+        self.playlist_scroll = ttk.Scrollbar(pf, orient="vertical", command=self.playlist_canvas.yview)
+        self.playlist_inner = tk.Frame(self.playlist_canvas, bg=self.panel)
+        self.playlist_window = self.playlist_canvas.create_window((0, 0), window=self.playlist_inner, anchor="nw")
+        self.playlist_canvas.configure(yscrollcommand=self.playlist_scroll.set)
+        self.playlist_inner.bind("<Configure>", lambda e: self.playlist_canvas.configure(
+            scrollregion=self.playlist_canvas.bbox("all")))
+        self.playlist_canvas.bind("<Configure>", lambda e: self.playlist_canvas.itemconfigure(
+            self.playlist_window, width=e.width))
+        self.bind_scroll_wheel(self.playlist_canvas, self.playlist_canvas)
+        self.bind_scroll_wheel(self.playlist_inner, self.playlist_canvas)
+        self.playlist_canvas.pack(side="left", fill="both", expand=True)
+        self.playlist_scroll.pack(side="right", fill="y")
+        self.button(self.side_inner, "+  NEW PLAYLIST", self.new_playlist, bg=self.panel2,
+                    fg=self.blue2, anchor="w", padx=18, pady=10).pack(fill="x", padx=10, pady=12)
+        self.refresh_playlists()
 
     def bind_scroll_wheel(self, widget, canvas):
         if not self.scroll_wheel_bound:
@@ -808,7 +1298,8 @@ class MusicVault(tk.Tk):
         pointer_x = self.winfo_pointerx()
         pointer_y = self.winfo_pointery()
         for region, canvas in ((self.home_dashboard, self.home_canvas),
-                               (self.playlist_canvas, self.playlist_canvas)):
+                       (self.playlist_canvas, self.playlist_canvas),
+                       (self.side_canvas, self.side_canvas)):
             if not region.winfo_ismapped():
                 continue
             left = region.winfo_rootx()
@@ -838,6 +1329,8 @@ class MusicVault(tk.Tk):
 
     def show_home_view(self):
         self.player_frame.pack(side="bottom", fill="x")
+        if self.account_frame:
+            self.account_frame.pack_forget()
         if self.now_playing_frame:
             self.now_playing_frame.pack_forget()
         if self.entity_frame:
@@ -880,10 +1373,12 @@ class MusicVault(tk.Tk):
         block = tk.Frame(self.home_inner, bg=self.bg)
         block.pack(fill="x", pady=(8, 18))
         compact = self.settings.get("density", "Comfortable") == "Compact"
-        card_width = 126 if compact else 142
+        available_width = max(360, self.content.winfo_width())
+        card_width = max(104, min(142, available_width // 5))
         card_height = 140 if compact else 155
         artwork_sizes = {"Small": 82, "Medium": 106, "Large": 124}
-        art_size = artwork_sizes.get(self.settings.get("home_artwork_size", "Medium"), 106)
+        art_size = min(artwork_sizes.get(self.settings.get("home_artwork_size", "Medium"), 106),
+                card_width - 18)
         if compact:
             art_size = min(art_size, 92)
         rail_height = 155 if compact else 170
@@ -911,6 +1406,8 @@ class MusicVault(tk.Tk):
                      font=("Segoe UI Semibold", 8), anchor="w").pack(fill="x", padx=8)
             tk.Label(card, text=song["artist"][:22], bg=self.panel, fg=self.muted,
                      font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=8)
+            tk.Label(card, text=rating_text(self.rating_value(song["id"])), bg=self.panel,
+                     fg="#fbbf24", font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=8)
             for widget in (card, image):
                 widget.bind("<Button-1>", lambda e, s=song: self.select_song_from_card(s))
                 widget.bind("<Double-Button-1>", lambda e, s=song: self.play_card_song(s))
@@ -932,17 +1429,23 @@ class MusicVault(tk.Tk):
     def build_player(self):
         heights = {"Compact": 104, "Standard": 128, "Tall": 154}
         p = tk.Frame(self, bg=self.panel, height=heights.get(
-            self.settings.get("player_height", "Standard"), 128))
+            self.settings.get("player_height", "Standard"), 128),
+                     highlightbackground=self.border, highlightthickness=1)
         self.player_frame = p
         p.pack(side="bottom", fill="x")
         p.pack_propagate(False)
 
-        self.art = tk.Label(p, text="♫", bg=self.panel2, fg=self.blue2,
-                            width=7, height=4, font=("Segoe UI",20))
-        self.art.pack(side="left", padx=15, pady=10)
+        art_wrap = tk.Frame(p, bg=self.panel2, width=76, height=76)
+        self.player_art_wrap = art_wrap
+        art_wrap.pack(side="left", padx=(18, 12), pady=12)
+        art_wrap.pack_propagate(False)
+        self.art = tk.Label(art_wrap, text="♫", bg=self.panel2, fg=self.blue2,
+                    font=("Segoe UI", 20))
+        self.art.pack(fill="both", expand=True)
         self.art.bind("<Button-1>", lambda e: self.show_now_playing())
 
         info = tk.Frame(p, bg=self.panel, width=250)
+        self.player_info = info
         info.pack(side="left", fill="y", pady=18)
         info.pack_propagate(False)
         self.now_title = tk.Label(info, text="Nothing playing", bg=self.panel,
@@ -956,14 +1459,16 @@ class MusicVault(tk.Tk):
         self.now_artist.bind("<Button-1>", lambda e: self.show_now_playing())
 
         center = tk.Frame(p, bg=self.panel)
+        self.player_center = center
         center.pack(side="left", fill="both", expand=True)
         controls = tk.Frame(center, bg=self.panel)
-        controls.pack(pady=(7,0))
+        controls.pack(pady=(8,0))
         self.shuffle_btn = self.player_button(controls,"⤨",self.toggle_shuffle)
         self.player_button(controls,"◀◀",self.previous)
         self.play_btn = tk.Button(controls,text="▶",command=self.toggle_play,
                                   bg=self.blue,fg="white",activebackground=self.blue2,
                                   relief="flat",width=4,font=("Segoe UI Semibold",12),
+                                  highlightthickness=0,
                                   cursor="hand2")
         self.play_btn.pack(side="left",padx=9)
         self.player_button(controls,"▶▶",self.next)
@@ -971,6 +1476,8 @@ class MusicVault(tk.Tk):
         self.like_btn = self.player_button(controls,"♡",self.like_current)
         self.dislike_btn = self.player_button(controls,"♧",self.dislike_current)
         self.fav_btn = self.player_button(controls,"☆",self.toggle_favorite_current)
+        self.player_button(controls,"INFO",lambda: self.open_track_details(self.current))
+        self.player_button(controls,"FULL",self.open_now_playing_window)
         self.player_button(controls,"☷ Queue",self.toggle_queue_panel)
 
         timeline = tk.Frame(center, bg=self.panel)
@@ -991,8 +1498,9 @@ class MusicVault(tk.Tk):
         self.total.pack(side="right")
 
         vol = tk.Frame(p,bg=self.panel)
+        self.player_volume = vol
         vol.pack(side="right",padx=18)
-        tk.Label(vol,text="VOL",bg=self.panel,fg=self.muted,
+        tk.Label(vol,text="VOLUME",bg=self.panel,fg=self.muted,
                  font=("Segoe UI Semibold",8)).pack()
         self.volume = ttk.Scale(vol,from_=0,to=1,orient="horizontal",
                                 value=float(self.settings.get("volume",.75)),
@@ -1232,22 +1740,121 @@ class MusicVault(tk.Tk):
             except Exception:
                 pass
         self.resize_job = self.after_idle(self.resize_now_playing)
+        if self.responsive_job:
+            try:
+                self.after_cancel(self.responsive_job)
+            except Exception:
+                pass
+        self.responsive_job = self.after_idle(self.adapt_layout)
+
+    def toggle_sidebar(self):
+        self.sidebar_visible = not self.sidebar_visible
+        if self.sidebar_visible:
+            self.side.pack(side="left", fill="y", before=self.content)
+        else:
+            self.side.pack_forget()
+        self.adapt_layout()
+
+    def adapt_layout(self):
+        self.responsive_job = None
+        width = max(1, self.winfo_width())
+        compact = width < 900
+        narrow = width < 760
+        if compact and not self.last_compact_layout:
+            self.sidebar_visible = False
+        elif not compact and self.last_compact_layout:
+            self.sidebar_visible = True
+        self.last_compact_layout = compact
+
+        if compact:
+            self.side.pack_forget()
+            self.menu_button.pack(side="left", padx=(0, 8), pady=13, before=self.search_entry.master)
+            if self.sidebar_visible:
+                self.side.place(x=0, y=0, relheight=1)
+                self.side.lift()
+            else:
+                self.side.place_forget()
+        else:
+            self.side.place_forget()
+            self.menu_button.pack_forget()
+            if self.sidebar_visible and not self.side.winfo_manager():
+                self.side.pack(side="left", fill="y", before=self.content)
+
+        self.content.pack_configure(padx=10 if narrow else 18 if compact else 26,
+                                    pady=12 if narrow else 16 if compact else 22)
+        if narrow:
+            self.sortbox.pack_forget()
+            self.quick_filter_bar.pack_forget()
+        else:
+            if not self.sortbox.winfo_manager():
+                self.sortbox.pack(side="right")
+            if (not self.quick_filter_bar.winfo_manager()
+                    and self.library_table.winfo_manager()):
+                try:
+                    self.quick_filter_bar.pack(fill="x", pady=(0, 10), before=self.library_table)
+                except tk.TclError:
+                    pass
+        for button in self.header_buttons:
+            if narrow and button is not self.header_buttons[0]:
+                button.pack_forget()
+            elif not button.winfo_manager():
+                button.pack(side="right", padx=5 if compact else 8, pady=13)
+
+        for index, button in enumerate(self.action_buttons):
+            if narrow and index >= 3:
+                button.pack_forget()
+            elif not button.winfo_manager():
+                button.pack(side="left", padx=3 if compact else 4)
+
+        if narrow:
+            self.tree.configure(displaycolumns=("title", "artist", "rating", "time"))
+        else:
+            self.tree.configure(displaycolumns=("title", "artist", "album", "genre", "year", "rating", "time"))
+        table_width = max(400, self.library_table.winfo_width())
+        if narrow:
+            widths = {"title": max(180, int(table_width * .48)),
+                      "artist": max(110, int(table_width * .28)), "rating": 78, "time": 70}
+        elif compact:
+            widths = {"title": max(220, int(table_width * .32)),
+                      "artist": max(140, int(table_width * .22)),
+                      "album": max(150, int(table_width * .22)), "genre": 100,
+                      "year": 55, "rating": 78, "time": 65}
+        else:
+            widths = {"title": 300, "artist": 180, "album": 220, "genre": 130,
+                      "year": 65, "rating": 90, "time": 75}
+        for column, column_width in widths.items():
+            self.tree.column(column, width=column_width, stretch=not narrow or column == "title")
+
+        if narrow:
+            self.player_info.pack_forget()
+            self.player_volume.pack_forget()
+            self.player_art_wrap.configure(width=58, height=58)
+        else:
+            if not self.player_info.winfo_manager():
+                self.player_info.pack(side="left", fill="y", pady=18, before=self.player_center)
+            if not self.player_volume.winfo_manager():
+                self.player_volume.pack(side="right", padx=18)
+            self.player_art_wrap.configure(width=76, height=76)
+        if narrow and self.queue_panel.winfo_manager():
+            self.queue_panel.pack_forget()
 
     def resize_now_playing(self):
         self.resize_job = None
         if not self.now_playing_frame or not self.now_playing_frame.winfo_manager():
             return
-        available_height = max(300, self.winfo_height() - 245)
-        available_width = max(300, self.content.winfo_width() - 40)
-        size = max(150, min(330, available_height * 38 // 100, available_width - 20))
+        available_height = max(220, self.winfo_height() - 245)
+        available_width = max(180, self.content.winfo_width() - 20)
+        size = max(96, min(330, available_height * 38 // 100, available_width - 20))
         art = self.make_art(self.current.get("artwork") if self.current else None, size)
         self.np_art.config(image=art, text="" if art else "♫", width=size, height=size)
         self.np_art.image = art
-        self.np_title.config(wraplength=max(300, available_width - 20))
+        self.np_title.config(wraplength=max(180, available_width - 20))
 
     def show_now_playing(self):
         self.capture_library_state()
         self.player_frame.pack(side="bottom", fill="x")
+        if self.account_frame:
+            self.account_frame.pack_forget()
         self.np_timeline.pack_forget()
         self.np_controls.pack_forget()
         for widget in self.library_widgets:
@@ -1350,6 +1957,8 @@ class MusicVault(tk.Tk):
 
     def show_library_view(self):
         self.player_frame.pack(side="bottom", fill="x")
+        if self.account_frame:
+            self.account_frame.pack_forget()
         self.pending_library_restore = self.view
         if self.now_playing_frame:
             self.now_playing_frame.pack_forget()
@@ -1377,7 +1986,7 @@ class MusicVault(tk.Tk):
         self.np_title.config(text=song["title"])
         self.np_artist.config(text=song["artist"])
         self.np_album.config(text=f'{song["album"]}  •  {song["year"] or "Year unknown"}')
-        self.np_rating.config(text="★" * self.db.rating(song["id"]) + "☆" * (5 - self.db.rating(song["id"])))
+        self.np_rating.config(text=rating_text(self.db.rating(song["id"])))
         self.np_seekbar.configure(to=max(1, song["duration"]))
         self.np_total.config(text=seconds_text(song["duration"]))
         self.np_elapsed.config(text=seconds_text(self.seek_var.get()))
@@ -1389,12 +1998,109 @@ class MusicVault(tk.Tk):
         self.view = view
         self.playlist_name = view.split(":",1)[1] if view.startswith("Playlist:") else None
         self.view_title.config(text=self.playlist_name or view)
+        for name in ["Home", "Songs", "Albums", "Artists", "Genres", "Recently Added", "Recently Played",
+                 "Most Played", "Favorites", "Liked Songs", "Never Played", "Top Rated", "Long Tracks",
+                 "5 Star Songs", "Library Health", "Account"]:
+            button = getattr(self, "nav_" + name.lower().replace(" ", "_"), None)
+            if button:
+                active = view == name
+                button.configure(bg=self.hover if active else self.panel,
+                                 fg=self.blue2 if active else self.text)
         if view == "Home":
             self.show_home_view()
         elif view == "Library Health":
             self.show_health_page()
+        elif view == "Account":
+            self.show_account_page()
         else:
             self.show_library_view()
+
+    def show_account_page(self):
+        self.player_frame.pack(side="bottom", fill="x")
+        for widget in self.library_widgets:
+            widget.pack_forget()
+        self.home_dashboard.pack_forget()
+        if self.now_playing_frame:
+            self.now_playing_frame.pack_forget()
+        if self.entity_frame:
+            self.entity_frame.pack_forget()
+        if self.health_frame:
+            self.health_frame.pack_forget()
+        if self.account_frame:
+            self.account_frame.destroy()
+        self.account_frame = tk.Frame(self.content, bg=self.bg)
+        self.account_frame.pack(fill="both", expand=True)
+
+        profile = tk.Frame(self.account_frame, bg=self.panel, cursor="hand2")
+        profile.pack(fill="x", pady=(4, 18))
+        avatar = self.profile_art(72)
+        avatar_label = tk.Label(profile, image=avatar, text="◎" if avatar is None else "",
+                    bg=self.panel, fg=self.blue2, font=("Segoe UI Semibold", 30))
+        avatar_label.image = avatar
+        avatar_label.pack(side="left", padx=(22, 12), pady=18)
+        copy = tk.Frame(profile, bg=self.panel)
+        copy.pack(side="left", fill="both", expand=True, pady=18)
+        name_label = tk.Label(copy, text=self.profile.get("name", "Local Listener"), bg=self.panel,
+                      fg=self.text, font=("Segoe UI Semibold", 22), cursor="hand2")
+        name_label.pack(anchor="w")
+        subtitle_label = tk.Label(copy, text="Local account • your library stays on this device", bg=self.panel,
+                      fg=self.muted, font=("Segoe UI", 9), cursor="hand2")
+        subtitle_label.pack(anchor="w", pady=(3, 0))
+        self.button(profile, "Profile settings", self.settings_window, bg=self.panel2,
+                    padx=12, pady=7).pack(side="right", padx=18)
+        self.button(profile, "Change picture", self.choose_profile_picture, bg=self.panel2,
+                padx=12, pady=7).pack(side="right", padx=4)
+        for widget in (profile, avatar_label, copy, name_label, subtitle_label):
+            widget.bind("<Button-1>", lambda event: self.account_area_clicked(), add="+")
+        self.animate_panel_focus(profile)
+
+        songs = self.get_library()
+        favorite_ids = self.db.favorites()
+        reactions = self.db.reactions()
+        played = self.db.most_played(2000)
+        listened_seconds = sum(song["duration"] * song.get("plays", 0) for song in played)
+        top_artist = played[0]["artist"] if played else "No plays yet"
+        stats = tk.Frame(self.account_frame, bg=self.bg)
+        stats.pack(fill="x", pady=(0, 16))
+        stat_values = [("SONGS", len(songs)), ("FAVORITES", len(favorite_ids)),
+                       ("LIKED", sum(value == 1 for value in reactions.values())),
+                       ("DISLIKED", sum(value == -1 for value in reactions.values())),
+                       ("LISTENED", seconds_text(listened_seconds)), ("TOP ARTIST", top_artist)]
+        for label, value in stat_values:
+            card = tk.Frame(stats, bg=self.panel2, highlightthickness=0)
+            card.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            tk.Label(card, text=str(value), bg=self.panel2, fg=self.text,
+                     font=("Segoe UI Semibold", 16 if label in ("LISTENED", "TOP ARTIST") else 20),
+                     wraplength=135).pack(anchor="w", padx=14, pady=(10, 0))
+            tk.Label(card, text=label, bg=self.panel2, fg=self.muted,
+                     font=("Segoe UI Semibold", 8)).pack(anchor="w", padx=14, pady=(0, 10))
+            self.animate_panel_focus(card, delay=80 * len(stats.winfo_children()))
+
+        columns = tk.Frame(self.account_frame, bg=self.bg)
+        columns.pack(fill="both", expand=True)
+        recent = self.db.history_songs(8)
+        liked = self.db.liked_songs(8)
+        disliked = [song for song in songs if reactions.get(song["id"]) == -1][:8]
+        favorites = [song for song in songs if song["id"] in favorite_ids][:8]
+        for title, items in (("Recently played", recent), ("Favorite songs", favorites),
+                             ("Liked songs", liked), ("Disliked songs", disliked)):
+            section = tk.Frame(columns, bg=self.panel)
+            section.pack(side="left", fill="both", expand=True, padx=(0, 10), pady=4)
+            tk.Label(section, text=title.upper(), bg=self.panel, fg=self.blue2,
+                     font=("Segoe UI Semibold", 9)).pack(anchor="w", padx=14, pady=(12, 8))
+            if not items:
+                tk.Label(section, text="Nothing here yet", bg=self.panel, fg=self.muted,
+                         font=("Segoe UI", 9)).pack(anchor="w", padx=14, pady=(6, 14))
+            for song in items:
+                row = self.button(section, f'{song["title"]}  •  {song["artist"]}',
+                                  lambda item=song: self.play_from_details(item),
+                                  bg=self.panel, anchor="w", padx=14, pady=5,
+                                  font=("Segoe UI", 9))
+                row.pack(fill="x")
+
+    def account_area_clicked(self):
+        self.set_view("Account")
+        self.toast("Account overview")
 
     def capture_library_state(self):
         if not hasattr(self, "tree") or self.view in ("Home", "Library Health"):
@@ -1424,6 +2130,8 @@ class MusicVault(tk.Tk):
 
     def show_health_page(self):
         self.player_frame.pack(side="bottom", fill="x")
+        if self.account_frame:
+            self.account_frame.pack_forget()
         for widget in self.library_widgets:
             widget.pack_forget()
         self.home_dashboard.pack_forget()
@@ -1462,8 +2170,162 @@ class MusicVault(tk.Tk):
                     bg=self.blue, fg="white", padx=13, pady=7).pack(side="left")
         self.button(actions, "Remove Dead Entries", self.remove_dead_entries,
                     bg=self.panel2, padx=13, pady=7).pack(side="left", padx=8)
+        self.button(actions, "Organize Library", self.organizer_window,
+                    bg=self.panel2, padx=13, pady=7).pack(side="left", padx=8)
+        self.button(actions, "Find Duplicates", self.open_library_duplicates,
+                    bg=self.panel2, padx=13, pady=7).pack(side="left", padx=8)
+        self.button(actions, "Repair Artwork", self.repair_library_artwork,
+                    bg=self.panel2, padx=13, pady=7).pack(side="left", padx=8)
         tk.Label(self.health_frame, text="MusicVault never deletes your music from this page.",
                  bg=self.bg, fg=self.muted, font=("Segoe UI", 10)).pack(anchor="w")
+
+    def open_library_duplicates(self):
+        groups = find_duplicate_groups(self.get_library())
+        matches = groups["exact"] or groups["likely"]
+        if not matches:
+            messagebox.showinfo("Duplicate finder", "No exact or likely duplicates were found.", parent=self)
+            return
+        win = tk.Toplevel(self)
+        win.title("MusicVault Library Duplicates")
+        win.geometry("760x460")
+        win.minsize(420, 320)
+        win.configure(bg=self.bg)
+        tk.Label(win, text="DUPLICATE REVIEW", bg=self.bg, fg=self.blue2,
+                 font=("Segoe UI Semibold", 11)).pack(anchor="w", padx=22, pady=(18, 4))
+        tk.Label(win, text="Review only. MusicVault does not delete files from this page.",
+                 bg=self.bg, fg=self.muted, font=("Segoe UI", 9)).pack(anchor="w", padx=22, pady=(0, 8))
+        listing = tk.Listbox(win, bg=self.panel, fg=self.text, relief="flat",
+                             selectbackground=self.blue, font=("Segoe UI", 9))
+        listing.pack(fill="both", expand=True, padx=22, pady=8)
+        for index, group in enumerate(matches, 1):
+            listing.insert("end", f"GROUP {index}  •  {len(group)} matching files")
+            for item in group:
+                listing.insert("end", f'    {item["artist"]} - {item["title"]}  •  {item["path"]}')
+        if groups["exact"]:
+            delete_command = lambda: self.delete_exact_duplicates(groups["exact"], win)
+        else:
+            def delete_command():
+                messagebox.showinfo(
+                    "No exact duplicates",
+                    "Only exact hash duplicates can be deleted.\n"
+                    "These matches are metadata-based and remain review-only.",
+                    parent=win,
+                )
+        self.button(
+            win, "Backup & Delete Exact Duplicates", delete_command,
+            bg="#9f1239" if groups["exact"] else self.panel2,
+            fg="white" if groups["exact"] else self.muted,
+            padx=14, pady=7,
+        ).pack(anchor="e", padx=22, pady=(0, 8))
+        self.button(win, "Close", win.destroy, bg=self.panel2,
+                    padx=14, pady=7).pack(anchor="e", padx=22, pady=(0, 18))
+
+    def delete_exact_duplicates(self, groups, window):
+        candidates = []
+        for group in groups:
+            if len(group) > 1:
+                candidates.extend(group[1:])
+        candidates = [song for song in candidates if os.path.isfile(song["path"])]
+        if not candidates:
+            self.toast("No duplicate files are available to delete")
+            return
+        backup_root = os.path.join(DATA_DIR, "duplicate-backups", time.strftime("%Y%m%d-%H%M%S"))
+        if not messagebox.askyesno(
+                "Back up and delete duplicates",
+                f"{len(candidates)} exact duplicate file(s) will be backed up, then removed. Continue?",
+                parent=window):
+            return
+        self.status.set(f"Backing up {len(candidates)} duplicate(s)...")
+        try:
+            window.destroy()
+        except tk.TclError:
+            pass
+
+        def worker():
+            backed_up = []
+            deleted = []
+            try:
+                os.makedirs(backup_root, exist_ok=True)
+                for index, song in enumerate(candidates, 1):
+                    source = song["path"]
+                    destination = os.path.join(
+                        backup_root, f"{index:04d}-{os.path.basename(source)}")
+                    temporary = destination + ".part"
+                    with open(source, "rb") as source_stream, open(temporary, "wb") as backup_stream:
+                        shutil.copyfileobj(source_stream, backup_stream, length=1024 * 1024)
+                        backup_stream.flush()
+                        os.fsync(backup_stream.fileno())
+                    shutil.copystat(source, temporary)
+                    if os.path.getsize(source) != os.path.getsize(temporary):
+                        raise OSError(f"Backup verification failed for {source}")
+                    os.replace(temporary, destination)
+                    backed_up.append((source, destination))
+
+                manifest = os.path.join(backup_root, "manifest.json")
+                with open(manifest, "w", encoding="utf-8") as stream:
+                    json.dump([{"source": source, "backup": destination}
+                               for source, destination in backed_up], stream, indent=2)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+
+                for source, destination in backed_up:
+                    os.remove(source)
+                    deleted.append((source, destination))
+                    time.sleep(0.05)
+                self.after(0, lambda: self.finish_duplicate_deletion(
+                    deleted, backup_root, None))
+            except (OSError, shutil.Error) as exc:
+                for temporary in [name for name in os.listdir(backup_root)] if os.path.isdir(backup_root) else []:
+                    if temporary.endswith(".part"):
+                        try:
+                            os.remove(os.path.join(backup_root, temporary))
+                        except OSError:
+                            pass
+                self.after(0, lambda: self.finish_duplicate_deletion(
+                    deleted, backup_root, str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_duplicate_deletion(self, deleted, backup_root, error):
+        if error:
+            messagebox.showerror(
+                "Duplicate removal stopped",
+                f"{len(deleted)} original(s) were removed before the operation stopped.\n\n{error}\n\n"
+                f"Any completed backups remain in:\n{backup_root}",
+                parent=self,
+            )
+            self.status.set("Duplicate removal stopped safely")
+            return
+        self.db.remove_missing([song["path"] for song in self.get_library() if os.path.exists(song["path"])])
+        self.invalidate_library()
+        self.refresh_playlists()
+        self.show_health_page()
+        self.toast(f"Removed {len(deleted)} duplicate(s); backups saved in {backup_root}")
+
+    def repair_library_artwork(self):
+        missing = [song for song in self.get_library() if not song.get("artwork")]
+        if not missing:
+            self.toast("All library entries already have artwork")
+            return
+        if not messagebox.askyesno(
+                "Repair artwork",
+                f"Look up artwork for {len(missing)} song(s)? This uses an online music service.",
+                parent=self):
+            return
+        self.status.set(f"Looking up artwork for {len(missing)} song(s)...")
+        def worker():
+            repaired = 0
+            for song in missing:
+                if self.download_cover_for_song(song, notify=False):
+                    repaired += 1
+            self.after(0, lambda: self.finish_artwork_repair(repaired, len(missing)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_artwork_repair(self, repaired, total):
+        self.invalidate_library()
+        self.album_art_cache.clear()
+        self.show_health_page()
+        self.toast(f"Artwork repaired for {repaired} of {total} song(s)")
 
     def remove_dead_entries(self):
         if not messagebox.askyesno("Remove dead entries",
@@ -1499,8 +2361,19 @@ class MusicVault(tk.Tk):
             return self.db.playlist(self.playlist_name)
         if self.view == "Recently Added":
             return self.db.recently_added(page_size)
+        if self.view == "Recently Played":
+            return self.db.history_songs(page_size)
         if self.view == "Most Played":
             return self.db.most_played(page_size)
+        if self.view == "Liked Songs":
+            return self.db.liked_songs(page_size)
+        if self.view == "Never Played":
+            return self.db.never_played(page_size)
+        if self.view == "Top Rated":
+            ratings = self.db.ratings()
+            return [song for song in self.get_library() if ratings.get(song["id"], 0) >= 4]
+        if self.view == "Long Tracks":
+            return [song for song in self.get_library() if song["duration"] >= 300]
         if self.view == "5 Star Songs":
             rated = self.db.ratings()
             return [song for song in self.get_library() if rated.get(song["id"]) == 5]
@@ -1512,6 +2385,22 @@ class MusicVault(tk.Tk):
             fav = self.db.favorites()
             songs = [s for s in songs if s["id"] in fav]
 
+        quick_filter = self.quick_filter.get()
+        if quick_filter == "Favorites":
+            favorites = self.db.favorites()
+            songs = [s for s in songs if s["id"] in favorites]
+        elif quick_filter == "Liked":
+            reactions = self.db.reactions()
+            songs = [s for s in songs if reactions.get(s["id"]) == 1]
+        elif quick_filter == "Rated":
+            ratings = self.db.ratings()
+            songs = [s for s in songs if ratings.get(s["id"], 0) > 0]
+        elif quick_filter == "Unplayed":
+            never_played = {s["id"] for s in self.db.never_played(len(self.get_library()))}
+            songs = [s for s in songs if s["id"] in never_played]
+        elif quick_filter == "Long Tracks":
+            songs = [s for s in songs if float(s.get("duration") or 0) >= 300]
+
         query = self.search.get().strip()
         operators = {}
         for match in re.finditer(r'(artist|album|genre|year|rating|format|liked|favorite|duration):("[^"]+"|\S+)', query, re.I):
@@ -1522,9 +2411,7 @@ class MusicVault(tk.Tk):
         reactions = self.db.reactions() if "liked" in operators else {}
         if free_text:
             terms = free_text.split()
-            songs = [s for s in songs if all(term in " ".join(
-                str(s[k]) for k in ("title","artist","album","genre","year","path")
-            ).lower() for term in terms)]
+            songs = [s for s in songs if all(term in str(s["title"]).lower() for term in terms)]
         for field in ("artist", "album", "genre", "year"):
             if field in operators:
                 value = operators[field]
@@ -1565,7 +2452,7 @@ class MusicVault(tk.Tk):
             "Artist":lambda s:s["artist"].lower(),
             "Album":lambda s:s["album"].lower(),
             "Year":lambda s:str(s["year"]),
-            "Rating":lambda s:self.db.rating(s["id"]),
+            "Rating":lambda s:self.rating_value(s["id"]),
             "Duration":lambda s:s["duration"],
             "Date Added":lambda s:s["added"],
         }.get(field,lambda s:s["title"].lower())
@@ -1585,6 +2472,14 @@ class MusicVault(tk.Tk):
         if self.library_cache is None:
             self.library_cache=self.db.all()
         return self.library_cache
+
+    def rating_value(self, song_id):
+        if self.rating_cache is None:
+            self.rating_cache = self.db.ratings()
+        return int(self.rating_cache.get(song_id, 0))
+
+    def invalidate_rating_cache(self):
+        self.rating_cache = None
 
     def invalidate_library(self):
         self.library_cache=None
@@ -1611,13 +2506,26 @@ class MusicVault(tk.Tk):
             rows=[]
             for i in range(pos,end):
                 s=self.visible[i]
+                display_title = {
+                    "Albums": s["album"],
+                    "Artists": s["artist"],
+                    "Genres": s["genre"],
+                }.get(self.view, s["title"])
                 rows.append((str(i),"",(
-                    s["title"],s["artist"],s["album"],s["genre"],s["year"],
-                    "★" * self.db.rating(s["id"]) + "☆" * (5 - self.db.rating(s["id"])),
+                    display_title,s["artist"],s["album"],s["genre"],s["year"],
+                    rating_text(self.rating_value(s["id"])),
                     seconds_text(s["duration"])
                 )))
             for iid,text,values in rows:
-                self.tree.insert("", "end", iid=iid, values=values)
+                song = self.visible[int(iid)]
+                tags = []
+                if i % 2:
+                    tags.append("stripe")
+                if self.db.rating(song["id"]):
+                    tags.append("rated")
+                if self.current and song["id"] == self.current["id"]:
+                    tags.append("current")
+                self.tree.insert("", "end", iid=iid, values=values, tags=tuple(tags))
             if end < len(self.visible):
                 self.render_job=self.after(1,lambda:render_chunk(end))
             else:
@@ -1671,12 +2579,18 @@ class MusicVault(tk.Tk):
     def refresh_albums(self):
         for c in self.album_strip.winfo_children():
             c.destroy()
-        if self.view not in ("Home","Albums") or not self.visible:
+        if self.view != "Albums" or not self.visible:
             self.album_strip.pack_forget()
             return
 
         if not self.album_strip.winfo_manager():
-            self.album_strip.pack(fill="x", pady=(12, 8), before=self.tree.master)
+            try:
+                if self.tree.master.winfo_manager():
+                    self.album_strip.pack(fill="x", pady=(12, 8), before=self.tree.master)
+                else:
+                    return
+            except tk.TclError:
+                return
 
         albums=[]
         seen=set()
@@ -1738,6 +2652,37 @@ class MusicVault(tk.Tk):
         except Exception:
             return None
 
+    def download_cover_for_song(self, song, notify=True):
+        if not song or song.get("artwork"):
+            if notify:
+                self.toast("This song already has artwork")
+            return False
+        query = urllib.parse.urlencode({"term": f'{song["artist"]} {song["album"]}',
+                                        "media": "music", "entity": "album", "limit": 1})
+        try:
+            with urllib.request.urlopen(f"https://itunes.apple.com/search?{query}", timeout=8) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            result = (payload.get("results") or [None])[0]
+            artwork_url = result.get("artworkUrl100") if result else None
+            if not artwork_url:
+                raise ValueError("No matching album artwork was found")
+            artwork_url = artwork_url.replace("100x100", "600x600")
+            with urllib.request.urlopen(artwork_url, timeout=10) as response:
+                artwork = response.read()
+            updated = dict(song)
+            updated["artwork"] = artwork
+            self.db.upsert(updated)
+            self.invalidate_library()
+            self.album_art_cache.clear()
+            if notify:
+                self.toast(f'Artwork downloaded for "{song["album"]}"')
+                self.refresh()
+            return True
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            if notify:
+                self.toast(f"Artwork lookup failed: {exc}")
+            return False
+
     def play_album(self,song):
         q=[s for s in self.get_library() if s["artist"]==song["artist"] and s["album"]==song["album"]]
         if not q:
@@ -1754,6 +2699,11 @@ class MusicVault(tk.Tk):
             try: out.append(self.visible[int(iid)])
             except Exception: pass
         return out
+
+    def selection_changed(self, event=None):
+        selected = self.tree.selection()
+        if selected and self.settings.get("show_status_bar", True):
+            self.status.set(f"{len(selected)} selected")
 
     def open_selected_details(self, event=None):
         row = self.tree.identify_row(event.y) if event else ""
@@ -1796,6 +2746,8 @@ class MusicVault(tk.Tk):
 
     def show_entity_page(self, title, subtitle, songs, artwork_song):
         self.player_frame.pack(side="bottom", fill="x")
+        if self.account_frame:
+            self.account_frame.pack_forget()
         for widget in self.library_widgets:
             widget.pack_forget()
         self.home_dashboard.pack_forget()
@@ -1854,8 +2806,9 @@ class MusicVault(tk.Tk):
                  font=("Segoe UI Semibold", 9)).pack(anchor="w", pady=(3, 6))
         table = tk.Frame(page, bg=self.panel)
         table.pack(fill="both", expand=True)
-        tree = ttk.Treeview(table, columns=("title", "album", "time"), show="headings")
-        for column, heading, width in (("title", "TITLE", 430), ("album", "ALBUM", 260), ("time", "TIME", 80)):
+        tree = ttk.Treeview(table, columns=("title", "album", "rating", "time"), show="headings")
+        for column, heading, width in (("title", "TITLE", 400), ("album", "ALBUM", 240),
+                           ("rating", "RATING", 90), ("time", "TIME", 80)):
             tree.heading(column, text=heading)
             tree.column(column, width=width, anchor="w")
         scroll = ttk.Scrollbar(table, orient="vertical", command=tree.yview)
@@ -1865,7 +2818,9 @@ class MusicVault(tk.Tk):
         table.rowconfigure(0, weight=1)
         table.columnconfigure(0, weight=1)
         for index, item in enumerate(songs):
-            tree.insert("", "end", iid=str(index), values=(item["title"], item["album"], seconds_text(item["duration"])))
+            tree.insert("", "end", iid=str(index), values=(
+                item["title"], item["album"], rating_text(self.rating_value(item["id"])),
+                seconds_text(item["duration"])))
         tree.bind("<Double-1>", lambda event: self.play_entity_selected(tree))
         self.entity_tree = tree
 
@@ -1908,11 +2863,11 @@ class MusicVault(tk.Tk):
         win.title(f'{song["title"]} - MusicVault')
         screen_width = self.winfo_screenwidth()
         screen_height = self.winfo_screenheight()
-        window_width = min(470, max(400, screen_width - 80))
-        window_height = min(610, max(460, screen_height - 70))
-        art_size = max(150, min(260, window_height - 420))
+        window_width = min(470, max(320, screen_width - 80))
+        window_height = min(610, max(400, screen_height - 70))
+        art_size = max(120, min(260, window_height - 300, window_width - 70))
         win.geometry(f"{window_width}x{window_height}")
-        win.minsize(min(400, window_width), min(460, window_height))
+        win.minsize(min(320, window_width), min(400, window_height))
         win.resizable(True, True)
         win.configure(bg=self.bg)
         win.transient(self)
@@ -1938,6 +2893,8 @@ class MusicVault(tk.Tk):
                  font=("Segoe UI Semibold", 11)).pack(pady=(4, 0))
         tk.Label(win, text=f'{song["album"]}  •  {song["year"] or "Year unknown"}',
                  bg=self.bg, fg=self.muted, font=("Segoe UI", 10)).pack(pady=(2, 14))
+        tk.Label(win, text=rating_text(self.db.rating(song["id"])),
+             bg=self.bg, fg="#fbbf24", font=("Segoe UI", 16)).pack(pady=(0, 12))
 
         meta = tk.Frame(win, bg=self.panel)
         meta.pack(fill="x", padx=24, pady=(0, 14))
@@ -2030,7 +2987,7 @@ class MusicVault(tk.Tk):
             if self.now_playing_frame and self.now_playing_frame.winfo_manager():
                 self.refresh_now_playing_page()
             self.refresh_now_window()
-            self.status.set(f'Playing {song["title"]}')
+            self.toast(f'Playing {song["title"]}')
         except Exception as e:
             messagebox.showerror("Playback error",str(e))
 
@@ -2051,11 +3008,15 @@ class MusicVault(tk.Tk):
         else:self.play(self.current)
 
     def set_play_symbols(self, symbol):
-        self.play_btn.config(text=symbol)
-        if hasattr(self, "np_play_button"):
-            self.np_play_button.config(text=symbol)
-        if hasattr(self, "window_play_button"):
-            self.window_play_button.config(text=symbol)
+        for name in ("play_btn", "np_play_button", "window_play_button"):
+            button = getattr(self, name, None)
+            if button is not None:
+                try:
+                    if button.winfo_exists():
+                        button.config(text=symbol)
+                except tk.TclError:
+                    if name == "window_play_button":
+                        self.window_play_button = None
 
     def next(self):
         if not self.queue:self.queue=self.filtered()
@@ -2180,11 +3141,34 @@ class MusicVault(tk.Tk):
 
                 if not pygame.mixer.music.get_busy() and not self.paused:
                     self.db.set_position(self.current["id"],0)
-                    if self.repeat=="one": self.play(self.current,start=0)
-                    else: self.next()
+                    if not self.transition_pending:
+                        self.transition_pending = True
+                        if self.repeat == "one":
+                            self.play(self.current, start=0)
+                            self.transition_pending = False
+                        else:
+                            fade_ms = max(0, int(self.settings.get("crossfade_seconds", 0) * 1000))
+                            if fade_ms:
+                                try:
+                                    pygame.mixer.music.fadeout(fade_ms)
+                                except Exception:
+                                    pass
+                            self.after(fade_ms, self.finish_transition)
             except Exception:
                 pass
+        if self.sleep_timer_end and time.monotonic() >= self.sleep_timer_end:
+            if pygame and self.current:
+                pygame.mixer.music.stop()
+            self.paused = True
+            self.sleep_timer_end = None
+            self.set_play_symbols("▶")
+            self.toast("Sleep timer stopped playback")
         self.after(400,self.player_tick)
+
+    def finish_transition(self):
+        self.transition_pending = False
+        if not self.closing:
+            self.next()
 
     def toggle_favorite_current(self):
         if self.current:
@@ -2196,6 +3180,7 @@ class MusicVault(tk.Tk):
         if self.current:
             current = self.db.rating(self.current["id"])
             self.db.set_rating(self.current["id"], value if value else (0 if current == 5 else current + 1))
+            self.invalidate_rating_cache()
             self.refresh_now_playing_page()
             self.refresh()
 
@@ -2203,6 +3188,7 @@ class MusicVault(tk.Tk):
         songs = self.selected()
         for song in songs:
             self.db.set_rating(song["id"], value)
+        self.invalidate_rating_cache()
         if songs and self.current and self.current["id"] in {song["id"] for song in songs}:
             self.refresh_now_playing_page()
         self.refresh()
@@ -2261,6 +3247,7 @@ class MusicVault(tk.Tk):
         m.add_command(label="Queue Artist",command=lambda:self.add_songs_to_queue(
             [item for item in self.get_library() if item["artist"] == s["artist"]]))
         m.add_command(label="View Details",command=lambda:self.open_track_details(s))
+        m.add_command(label="Download Album Artwork", command=lambda:self.download_cover_for_song(s))
         m.add_command(label="Open Album",command=lambda:self.open_album_page(s))
         m.add_command(label="Open Artist",command=lambda:self.open_artist_page(s))
         m.add_command(label="Edit Metadata",command=lambda:self.edit_metadata(s))
@@ -2380,7 +3367,7 @@ class MusicVault(tk.Tk):
     def add_queue(self,s):
         self.queue.append(s)
         self.refresh_queue_panel()
-        self.status.set(f'Added "{s["title"]}" to queue')
+        self.toast(f'Added "{s["title"]}" to queue')
 
     def play_next_song(self,s):
         if not self.queue:self.queue=self.filtered()
@@ -2429,7 +3416,10 @@ class MusicVault(tk.Tk):
     def settings_window(self):
         win=tk.Toplevel(self)
         win.title("MusicVault Settings")
-        win.geometry("800x670")
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        win.geometry(f"{min(800, max(360, screen_width - 80))}x{min(670, max(460, screen_height - 100))}")
+        win.minsize(360, 460)
         win.configure(bg=self.bg)
         win.transient(self)
 
@@ -2491,6 +3481,22 @@ class MusicVault(tk.Tk):
         player_height=tk.StringVar(value=self.settings.get("player_height", "Standard"))
         home_artwork_size=tk.StringVar(value=self.settings.get("home_artwork_size", "Medium"))
         library_page_size=tk.StringVar(value=str(self.settings.get("library_page_size", 250)))
+        profile_name=tk.StringVar(value=self.profile.get("name", "Local Listener"))
+        accent=tk.StringVar(value=self.settings.get("accent", "blue"))
+        confirm_exit=tk.BooleanVar(value=self.settings.get("confirm_exit", False))
+        show_account_summary=tk.BooleanVar(value=self.settings.get("show_account_summary", True))
+        minimize_to_tray=tk.BooleanVar(value=self.settings.get("minimize_to_tray", False))
+        toast_notifications=tk.BooleanVar(value=self.settings.get("toast_notifications", True))
+        media_keys=tk.BooleanVar(value=self.settings.get("media_keys", True))
+        auto_download_artwork=tk.BooleanVar(value=self.settings.get("auto_download_artwork", False))
+        crossfade_seconds=tk.StringVar(value=str(self.settings.get("crossfade_seconds", 0)))
+        font_family=tk.StringVar(value=self.settings.get("font_family", "Segoe UI"))
+        nav_options = ["Recently Added", "Recently Played", "Most Played", "Liked Songs",
+                   "Top Rated", "Long Tracks", "5 Star Songs"]
+        visible_nav = self.settings.get("visible_nav", ["Home", "Songs", "Albums", "Artists",
+                                 "Genres", "Favorites", "Never Played",
+                                 "Account", "Library Health"])
+        nav_vars = {name: tk.BooleanVar(value=name in visible_nav) for name in nav_options}
         saved_home_sections = self.settings.get("home_sections", {})
         if not isinstance(saved_home_sections, dict):
             saved_home_sections = {}
@@ -2507,13 +3513,47 @@ class MusicVault(tk.Tk):
                          ("Use smooth UI transitions",smooth_ui),
                          ("Reduce motion and animations",reduced_motion),
                          ("Remember shuffle state",remember_shuffle),
-                         ("Remember repeat mode",remember_repeat)]:
+                         ("Remember repeat mode",remember_repeat),
+                         ("Confirm before closing MusicVault",confirm_exit),
+                         ("Show account activity summary",show_account_summary),
+                         ("Minimize to tray when closing",minimize_to_tray),
+                         ("Show toast notifications",toast_notifications),
+                         ("Enable media keys",media_keys),
+                         ("Automatically download missing album artwork",auto_download_artwork)]:
             tk.Checkbutton(opts,text=text,variable=var,bg=self.bg,fg=self.text,
                            selectcolor=self.panel2,activebackground=self.bg,
                            activeforeground=self.text).pack(anchor="w")
 
         tk.Label(opts,text="Blue theme • local playback • no music uploads",
                  bg=self.bg,fg=self.muted,font=("Segoe UI",9)).pack(anchor="w",pady=(7,0))
+        account_row=tk.Frame(opts,bg=self.bg)
+        account_row.pack(fill="x", pady=(10, 0))
+        tk.Label(account_row,text="Profile name",bg=self.bg,fg=self.text,
+             font=("Segoe UI Semibold",9),width=20,anchor="w").pack(side="left")
+        tk.Entry(account_row,textvariable=profile_name,bg=self.panel2,fg=self.text,
+             insertbackground=self.text,relief="flat",width=22).pack(side="left",padx=12,ipady=4)
+        self.button(account_row,"Change PIN",self.set_profile_pin,bg=self.panel2,
+                padx=10,pady=5).pack(side="left",padx=4)
+        accent_row=tk.Frame(opts,bg=self.bg)
+        accent_row.pack(fill="x", pady=(8, 0))
+        tk.Label(accent_row,text="Accent color",bg=self.bg,fg=self.text,
+             font=("Segoe UI Semibold",9),width=20,anchor="w").pack(side="left")
+        ttk.Combobox(accent_row,textvariable=accent,values=["blue","teal","gold","rose"],
+                 state="readonly",width=20).pack(side="left",padx=12)
+        font_row=tk.Frame(opts,bg=self.bg)
+        font_row.pack(fill="x", pady=(8, 0))
+        tk.Label(font_row,text="Interface font",bg=self.bg,fg=self.text,
+             font=("Segoe UI Semibold",9),width=20,anchor="w").pack(side="left")
+        ttk.Combobox(font_row,textvariable=font_family,
+                 values=["Segoe UI", "Segoe UI Variable", "Aptos", "Verdana"],
+                 state="readonly",width=20).pack(side="left",padx=12)
+        crossfade_row=tk.Frame(opts,bg=self.bg)
+        crossfade_row.pack(fill="x", pady=(8, 0))
+        tk.Label(crossfade_row,text="Crossfade",bg=self.bg,fg=self.text,
+             font=("Segoe UI Semibold",9),width=20,anchor="w").pack(side="left")
+        ttk.Combobox(crossfade_row,textvariable=crossfade_seconds,
+             values=["0", "2", "4", "6", "8", "10"],
+             state="readonly",width=20).pack(side="left",padx=12)
         density_row=tk.Frame(opts,bg=self.bg)
         density_row.pack(fill="x", pady=(8, 0))
         tk.Label(density_row,text="Interface density",bg=self.bg,fg=self.text,
@@ -2531,7 +3571,9 @@ class MusicVault(tk.Tk):
         display_row=tk.Frame(opts,bg=self.bg)
         display_row.pack(fill="x", pady=(8, 0))
         for label, variable, values in (
-            ("Startup view", startup_view, ["Home", "Songs", "Albums", "Artists", "Favorites", "Recently Added", "Most Played"]),
+            ("Startup view", startup_view, ["Home", "Songs", "Albums", "Artists", "Favorites", "Recently Added",
+                                             "Recently Played", "Most Played", "Liked Songs", "Never Played",
+                                             "Top Rated", "Long Tracks", "Account"]),
             ("Player height", player_height, ["Compact", "Standard", "Tall"]),
             ("Home artwork", home_artwork_size, ["Small", "Medium", "Large"]),
             ("Library result limit", library_page_size, ["100", "250", "500", "1000"]),
@@ -2551,6 +3593,12 @@ class MusicVault(tk.Tk):
             tk.Checkbutton(opts,text=label,variable=home_section_vars[key],bg=self.bg,fg=self.text,
                            selectcolor=self.panel2,activebackground=self.bg,
                            activeforeground=self.text).pack(anchor="w")
+        tk.Label(opts,text="OPTIONAL NAVIGATION",bg=self.bg,fg=self.muted,
+                 font=("Segoe UI Semibold",9)).pack(anchor="w",pady=(12,4))
+        for label, variable in nav_vars.items():
+            tk.Checkbutton(opts,text=label,variable=variable,bg=self.bg,fg=self.text,
+                           selectcolor=self.panel2,activebackground=self.bg,
+                           activeforeground=self.text).pack(anchor="w")
 
         foot=tk.Frame(win,bg=self.bg);foot.pack(fill="x",padx=25,pady=(0,20))
         def save(and_scan=False):
@@ -2568,20 +3616,43 @@ class MusicVault(tk.Tk):
             self.settings["home_artwork_size"]=home_artwork_size.get()
             self.settings["library_page_size"]=int(library_page_size.get())
             self.settings["home_sections"]={key: variable.get() for key, variable in home_section_vars.items()}
+            default_nav = ["Home", "Songs", "Albums", "Artists", "Genres", "Favorites",
+                           "Never Played", "Account", "Library Health"]
+            self.settings["visible_nav"] = default_nav + [name for name, variable in nav_vars.items()
+                                                            if variable.get()]
             self.settings["remember_shuffle"]=remember_shuffle.get()
             self.settings["remember_repeat"]=remember_repeat.get()
             self.settings["scan_hidden"]=scan_hidden.get()
             self.settings["confirm_remove_favorite"]=confirm_remove_favorite.get()
             self.settings["shuffle_mode"]=shuffle_mode.get()
+            self.profile["name"] = profile_name.get().strip() or "Local Listener"
+            self.settings["profile"] = self.profile
+            self.settings["accent"] = accent.get()
+            self.settings["font_family"] = font_family.get()
+            self.font_family = font_family.get()
+            self.option_add("*Font", (self.font_family, 10))
+            self.settings["confirm_exit"] = confirm_exit.get()
+            self.settings["show_account_summary"] = show_account_summary.get()
+            self.settings["minimize_to_tray"] = minimize_to_tray.get()
+            self.settings["toast_notifications"] = toast_notifications.get()
+            self.settings["media_keys"] = media_keys.get()
+            self.settings["auto_download_artwork"] = auto_download_artwork.get()
+            self.settings["crossfade_seconds"] = int(crossfade_seconds.get())
             self.shuffle_mode=shuffle_mode.get()
+            self.blue, self.blue2 = {"blue": ("#3b82f6", "#60a5fa"),
+                                     "teal": ("#0d9488", "#5eead4"),
+                                     "gold": ("#d97706", "#fbbf24"),
+                                     "rose": ("#e11d48", "#fb7185")}.get(
+                                         accent.get(), ("#3b82f6", "#60a5fa"))
             self.style_widgets()
             self.player_frame.config(height={"Compact": 104, "Standard": 128, "Tall": 154}.get(
                 player_height.get(), 128))
             save_settings(self.settings);win.destroy()
+            self.rebuild_navigation()
             if statusbar.get():
-                self.status_label.place(x=240, y=53)
+                self.status_label.pack(side="bottom", fill="x", padx=12, pady=(0, 3))
             else:
-                self.status_label.place_forget()
+                self.status_label.pack_forget()
             self.album_strip.pack_forget() if not albumstrip.get() else None
             if albumstrip.get() and self.album_strip.winfo_manager()=="":
                 self.album_strip.pack(fill="x", pady=(12,8), before=self.tree.master)
@@ -2701,7 +3772,7 @@ class MusicVault(tk.Tk):
         tk.Label(win, text="ORGANIZATION PREVIEW", bg=self.bg, fg=self.blue2,
                  font=("Segoe UI Semibold", 10)).pack(anchor="w", padx=22, pady=(18, 4))
         tk.Label(win, text="Nothing moves until you confirm Apply.", bg=self.bg, fg=self.muted,
-                 font=("Segoe UI", 9)).pack(anchor="w", padx=22, pady=(0, 8))
+             font=("Segoe UI", 9)).pack(anchor="w", padx=22, pady=(0, 8))
         listing = tk.Listbox(win, bg=self.panel, fg=self.text, relief="flat",
                              font=("Segoe UI", 9))
         listing.pack(fill="both", expand=True, padx=22, pady=8)
@@ -2802,7 +3873,10 @@ class MusicVault(tk.Tk):
                     modified = os.path.getmtime(path)
                     item = old.get(path)
                     if item is None or abs(float(item[1]) - modified) > 0.001:
-                        self.db.upsert(metadata(path))
+                        song = metadata(path)
+                        self.db.upsert(song)
+                        if self.settings.get("auto_download_artwork", False) and not song.get("artwork"):
+                            self.download_cover_for_song(song, notify=False)
                         changed += 1
                     if changed % 25 == 0:
                         self.scan_progress = (changed, total)
@@ -2823,6 +3897,13 @@ class MusicVault(tk.Tk):
         self.refresh_playlists()
 
     def close(self):
+        if (not self.closing and self.settings.get("minimize_to_tray", False)
+            and self.tray_icon is None):
+            if self.minimize_to_tray():
+                return
+        if self.settings.get("confirm_exit", False) and not self.closing:
+            if not messagebox.askyesno("Close MusicVault", "Close the player?", parent=self):
+                return
         self.closing = True
         self.scan_cancel.set()
         if self.scan_thread and self.scan_thread.is_alive():
@@ -2841,4 +3922,12 @@ class MusicVault(tk.Tk):
 
 
 if __name__ == "__main__":
-    MusicVault().mainloop()
+    startup = parse_startup_args()
+    if startup.data_dir:
+        DATA_DIR = os.path.abspath(startup.data_dir)
+        DB_FILE = os.path.join(DATA_DIR, "musicvault.db")
+        SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+    if startup.debug or startup.dev:
+        print(f"MusicVault data directory: {DATA_DIR}")
+        print(f"MusicVault startup view: {startup.view or 'configured default'}")
+    MusicVault(startup).mainloop()
